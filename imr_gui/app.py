@@ -25,6 +25,9 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QScrollArea,
     QSplitter,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QStatusBar,
     QToolButton,
     QVBoxLayout,
@@ -230,6 +233,8 @@ class MainWindow(QMainWindow):
 
         physics_menu = self.menuBar().addMenu("Physics")
         physics_menu.addAction("Bubble dynamics: Keller-Miksis (fixed)").setEnabled(False)
+        act_phys_settings = physics_menu.addAction("Physics Settings...")
+        act_phys_settings.triggered.connect(self._show_physics_settings)
 
         settings_menu = self.menuBar().addMenu("Settings")
         settings_menu.addAction("Parallelism / Optimizer (coming soon)").setEnabled(False)
@@ -248,10 +253,7 @@ class MainWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
 
-        # ---- Physics group box ----
-        physics_box = QGroupBox("Physics")
-        physics_lay = QVBoxLayout(physics_box)
-
+        # ---- Model selector row ----
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("Model:"))
         self._cmb_model = QComboBox()
@@ -259,92 +261,10 @@ class MainWindow(QMainWindow):
             self._cmb_model.addItem(key)
         self._cmb_model.setCurrentText("NHKV")
         model_row.addWidget(self._cmb_model, stretch=1)
-        physics_lay.addLayout(model_row)
+        left_layout.addLayout(model_row)
 
-        row_pinf = QHBoxLayout()
-        row_pinf.addWidget(QLabel("P_inf (Pa)"))
-        self.spin_P_inf = _NoWheelSpinBox()
-        self.spin_P_inf.setRange(1.0, 1e9)
-        self.spin_P_inf.setDecimals(1)
-        self.spin_P_inf.setValue(101325.0)
-        self.spin_P_inf.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        row_pinf.addWidget(self.spin_P_inf, stretch=1)
-        physics_lay.addLayout(row_pinf)
-
-        row_rho = QHBoxLayout()
-        row_rho.addWidget(QLabel("rho (kg/m³)"))
-        self.spin_rho = _NoWheelSpinBox()
-        self.spin_rho.setRange(1.0, 1e6)
-        self.spin_rho.setDecimals(1)
-        self.spin_rho.setValue(998.0)
-        self.spin_rho.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        row_rho.addWidget(self.spin_rho, stretch=1)
-        physics_lay.addLayout(row_rho)
-
-        row_nt = QHBoxLayout()
-        row_nt.addWidget(QLabel("NT (grid)"))
-        self.spin_NT = _NoWheelSpinBox()
-        self.spin_NT.setRange(50, 2000)
-        self.spin_NT.setDecimals(0)
-        self.spin_NT.setSingleStep(50)
-        self.spin_NT.setValue(500)
-        self.spin_NT.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        row_nt.addWidget(self.spin_NT, stretch=1)
-        physics_lay.addLayout(row_nt)
-
-        # -- collapsible Advanced Solver Settings --
-        self._adv_toggle = QToolButton()
-        self._adv_toggle.setText("▸ Advanced Solver Settings")
-        self._adv_toggle.setCheckable(True)
-        self._adv_toggle.setChecked(False)
-        self._adv_toggle.setStyleSheet("QToolButton { border: none; }")
-        self._adv_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self._adv_toggle.toggled.connect(self._toggle_advanced_solver)
-        physics_lay.addWidget(self._adv_toggle)
-
-        self._adv_solver_widget = QWidget()
-        adv_lay = QVBoxLayout(self._adv_solver_widget)
-        adv_lay.setContentsMargins(12, 0, 0, 0)
-
-        row_solver = QHBoxLayout()
-        row_solver.addWidget(QLabel("ODE solver"))
-        self._cmb_solver = QComboBox()
-        self._cmb_solver.addItems(["BDF", "Radau", "LSODA"])
-        self._cmb_solver.setCurrentText("BDF")
-        self._cmb_solver.setToolTip(
-            "Radau: L-stable implicit RK (closest to MATLAB ode23tb)\n"
-            "BDF: variable-order backward-differentiation (fast, stiff)\n"
-            "LSODA: auto-switching Adams/BDF"
-        )
-        row_solver.addWidget(self._cmb_solver, stretch=1)
-        adv_lay.addLayout(row_solver)
-
-        row_rtol = QHBoxLayout()
-        row_rtol.addWidget(QLabel("RelTol"))
-        self.spin_rtol = _NoWheelSpinBox()
-        self.spin_rtol.setRange(1e-14, 1e-1)
-        self.spin_rtol.setDecimals(0)
-        self.spin_rtol.setSpecialValueText("1e-8")
-        self.spin_rtol.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self._spin_rtol_line = _SciNotationSpinBox(self.spin_rtol, 1e-8)
-        row_rtol.addWidget(self.spin_rtol, stretch=1)
-        adv_lay.addLayout(row_rtol)
-
-        row_atol = QHBoxLayout()
-        row_atol.addWidget(QLabel("AbsTol"))
-        self.spin_atol = _NoWheelSpinBox()
-        self.spin_atol.setRange(1e-14, 1e-1)
-        self.spin_atol.setDecimals(0)
-        self.spin_atol.setSpecialValueText("1e-7")
-        self.spin_atol.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self._spin_atol_line = _SciNotationSpinBox(self.spin_atol, 1e-7)
-        row_atol.addWidget(self.spin_atol, stretch=1)
-        adv_lay.addLayout(row_atol)
-
-        self._adv_solver_widget.setVisible(False)
-        physics_lay.addWidget(self._adv_solver_widget)
-
-        left_layout.addWidget(physics_box, stretch=0)
+        # ---- Build physics settings (kept as persistent widgets) ----
+        self._build_physics_settings()
 
         # ---- parameter box with scroll area ----
         self._param_box = QGroupBox("Parameters")
@@ -463,8 +383,94 @@ class MainWindow(QMainWindow):
 
     # =====================================================================
     # =====================================================================
-    # collapsible advanced solver settings
+    # Physics Settings dialog
     # =====================================================================
+
+    def _build_physics_settings(self):
+        """Create the persistent widgets used in the Physics Settings dialog."""
+        self.spin_P_inf = _NoWheelSpinBox()
+        self.spin_P_inf.setRange(1.0, 1e9)
+        self.spin_P_inf.setDecimals(1)
+        self.spin_P_inf.setValue(101325.0)
+        self.spin_P_inf.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+        self.spin_rho = _NoWheelSpinBox()
+        self.spin_rho.setRange(1.0, 1e6)
+        self.spin_rho.setDecimals(1)
+        self.spin_rho.setValue(998.0)
+        self.spin_rho.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+        self.spin_NT = _NoWheelSpinBox()
+        self.spin_NT.setRange(50, 2000)
+        self.spin_NT.setDecimals(0)
+        self.spin_NT.setSingleStep(50)
+        self.spin_NT.setValue(500)
+        self.spin_NT.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+        self._cmb_solver = QComboBox()
+        self._cmb_solver.addItems(["BDF", "Radau", "LSODA"])
+        self._cmb_solver.setCurrentText("BDF")
+        self._cmb_solver.setToolTip(
+            "Radau: L-stable implicit RK (closest to MATLAB ode23tb)\n"
+            "BDF: variable-order backward-differentiation (fast, stiff)\n"
+            "LSODA: auto-switching Adams/BDF"
+        )
+
+        self.spin_rtol = _NoWheelSpinBox()
+        self.spin_rtol.setRange(1e-14, 1e-1)
+        self.spin_rtol.setDecimals(0)
+        self.spin_rtol.setSpecialValueText("1e-8")
+        self.spin_rtol.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._spin_rtol_line = _SciNotationSpinBox(self.spin_rtol, 1e-8)
+
+        self.spin_atol = _NoWheelSpinBox()
+        self.spin_atol.setRange(1e-14, 1e-1)
+        self.spin_atol.setDecimals(0)
+        self.spin_atol.setSpecialValueText("1e-7")
+        self.spin_atol.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._spin_atol_line = _SciNotationSpinBox(self.spin_atol, 1e-7)
+
+    def _show_physics_settings(self):
+        """Open a modal dialog for P_inf, rho, NT, and solver settings."""
+        if not hasattr(self, "_physics_dlg"):
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Physics Settings")
+            dlg.setMinimumWidth(360)
+            lay = QVBoxLayout(dlg)
+
+            form = QFormLayout()
+            form.addRow("P_inf (Pa):", self.spin_P_inf)
+            form.addRow("rho (kg/m³):", self.spin_rho)
+            form.addRow("NT (grid):", self.spin_NT)
+            lay.addLayout(form)
+
+            # -- collapsible Advanced Solver Settings --
+            self._adv_toggle = QToolButton()
+            self._adv_toggle.setText("▸ Advanced Solver Settings")
+            self._adv_toggle.setCheckable(True)
+            self._adv_toggle.setChecked(False)
+            self._adv_toggle.setStyleSheet("QToolButton { border: none; }")
+            self._adv_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            lay.addWidget(self._adv_toggle)
+
+            self._adv_solver_widget = QWidget()
+            adv_form = QFormLayout(self._adv_solver_widget)
+            adv_form.setContentsMargins(12, 0, 0, 0)
+            adv_form.addRow("ODE solver:", self._cmb_solver)
+            adv_form.addRow("RelTol:", self.spin_rtol)
+            adv_form.addRow("AbsTol:", self.spin_atol)
+            self._adv_solver_widget.setVisible(False)
+            lay.addWidget(self._adv_solver_widget)
+
+            self._adv_toggle.toggled.connect(self._toggle_advanced_solver)
+
+            btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            btn_box.rejected.connect(dlg.accept)
+            lay.addWidget(btn_box)
+
+            self._physics_dlg = dlg
+
+        self._physics_dlg.exec()
 
     def _toggle_advanced_solver(self, checked: bool):
         self._adv_solver_widget.setVisible(checked)
