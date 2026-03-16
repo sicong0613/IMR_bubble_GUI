@@ -1,0 +1,98 @@
+{
+  "id": "NHKV",
+  "display_name": "Neo-Hookean Kelvin-Voigt (NHKV)",
+  "description": "Simple neo-Hookean solid with a Kelvin-Voigt viscous term, used as the surrounding material model in the IMR LIC solver.",
+  "parameters": [
+    {
+      "name": "U0",
+      "label": "U0",
+      "units": [
+        { "label": "m/s", "factor": 1.0 }
+      ],
+      "default": 100.0,
+      "lb": 80.0,
+      "ub": 120.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "G",
+      "label": "G",
+      "units": [
+        { "label": "Pa",  "factor": 1.0 },
+        { "label": "kPa", "factor": 1e3 },
+        { "label": "MPa", "factor": 1e6 }
+      ],
+      "default": 8.0e6,
+      "lb": 1.0e6,
+      "ub": 2.0e7,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "mu",
+      "label": "mu",
+      "units": [
+        { "label": "Pa·s", "factor": 1.0 }
+      ],
+      "default": 0.226,
+      "lb": 0.01,
+      "ub": 1e2,
+      "scale": "log",
+      "fit_default": true
+    }
+  ],
+  "constants": {
+    "_comment": "Non-fittable physical constants. Edit values here; they are loaded at startup.",
+
+    "T_inf":  298.15,
+    "T_inf_unit": "K",
+    "T_inf_desc": "Far-field temperature",
+
+    "c_long": 1485.0,
+    "c_long_unit": "m/s",
+    "c_long_desc": "Longitudinal wave speed in the surrounding medium",
+
+    "gamma":  0.056,
+    "gamma_unit": "N/m",
+    "gamma_desc": "Surface tension at the bubble wall",
+
+    "alpha":  0.0,
+    "alpha_desc": "Strain-stiffening parameter (0 = neo-Hookean)",
+
+    "D0":     24.2e-6,
+    "D0_unit": "m^2/s",
+    "D0_desc": "Binary diffusion coefficient (vapor–air inside bubble)",
+
+    "kappa":  1.4,
+    "kappa_desc": "Specific heats ratio (gas inside bubble)",
+
+    "Ru":     8.3144598,
+    "Ru_unit": "J/(mol·K)",
+    "Ru_desc": "Universal gas constant",
+
+    "A_therm": 5.28e-5,
+    "A_therm_unit": "W/(m·K^2)",
+    "A_therm_desc": "Thermal conductivity linear coefficient (K = A*T + B)",
+
+    "B_therm": 0.0117,
+    "B_therm_unit": "W/(m·K)",
+    "B_therm_desc": "Thermal conductivity constant coefficient (K = A*T + B)",
+
+    "P_ref":  1.17e11,
+    "P_ref_unit": "Pa",
+    "P_ref_desc": "Reference pressure for Clausius–Clapeyron vapor pressure",
+
+    "T_ref":  5200.0,
+    "T_ref_unit": "K",
+    "T_ref_desc": "Reference temperature for Clausius–Clapeyron vapor pressure",
+
+    "M_vapor": 18.01528e-3,
+    "M_vapor_unit": "kg/mol",
+    "M_vapor_desc": "Molar mass of vapor (water)",
+
+    "M_air":  28.966e-3,
+    "M_air_unit": "kg/mol",
+    "M_air_desc": "Molar mass of air"
+  }
+}

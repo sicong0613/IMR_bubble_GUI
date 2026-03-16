@@ -1,0 +1,62 @@
+虽然我是用中文描述需求，在GUI中请一律用英文
+
+1. 用python或是C++重构以patternsearch和IMR为核心的matlab fitting代码
+2. 增加GUI，左侧为参数输入界面，右侧为fitting预览界面（上半）+参数输出界面（下半）
+
+
+3. GUI菜单栏选项卡:“File”，“Module”，“Physics”，“settings”
+	a. “文件”内有加载实验数据，加载参数，保存参数，保存拟合参数。
+		加载实验数据，应该打开一个文件选择界面，可以选择一个mat文件。mat文件里应该包含两个相同size的一维变量“R”和“t”（可以的话添加粗略识别，把“r”，“radius”，“R1”，“time”这些关键字都加进去）。默认r和t数据都是以米和秒为单位的。加载完成之后在右边预览处以黑色方形散点展示并添加“exp data”的图例
+	b. “模块”有simulation和fitting两个模块
+		先做两个module，两个模块GUI显示基本相同，区别在于，一个是预览，即输入参数，生成simulation结果，一个是fitting，以输入的参数为initial guess，进行以least square error为基础的optimization。底部放一个稍显眼的按钮，如果是simulation则文字为“simulate”，fitting模块则显示 fit。在simulate时，请添加一个进度条，提示还需要多久完成simulation
+	c. “Physics”里则将有关的物理模型设置为可替换的，我预想的希望包括，不同的bubble dynamics（Rayleigh Plesset或是Keller Miksis）
+		在Physics选项卡最底下添加“add constitution”“delete constitution”的按钮
+		首先最刚需的是可选的本构模型，这部分我还不确定能不能实现，毕竟在MATLAB代码里本构模型的实现十分分散。但是如果可以实现的话，我希望以代码包和json配置的方式实现本构模型热替换，代码包应当尽可能简单，只体现本构特性（还有粘弹性模型）而不涉及IMR计算，输入为各类材料参数。json里则记录代码包和对应的本构名字以及需要的材料参数（和默认值以方便确认该设置是否正常能用）
+		添加新的本构模型代码包后，，用于确认该json和代码包是否正常可用，如果可用，就把该本构包读取并保存
+		选择本构模型的按钮就不要放在选项卡里面了，就放在参数输入界面顶部，选项卡下面，这样一眼就能看到用的是哪个本构。选择完本构后，GUI参数选择自动根据选择的本构显示需要的材料参数，每个参数应该包含一个可以选择“是”或“否”的选择框（用是否打勾来表示，用于表示该参数是否参与拟合，还是只作为常参数进入simulaiton），一个数值输入窗口和两个选项卡，数值输入窗口旁边那个是单位，如果是模量那单位就是Pa，kPa，Mpa等等。再旁边的选项卡是步进的scale，有linear和logarithm，在simulation模块里这个选项应该是灰的，不可用，这个选项只在fitting时有用。
+
+然后是fitting模块的特殊需求。fitting模块除以上需求外，还有以下需求：
+在进入fitting模块后，在r-t预览（当然是加载了实验数据后可见）界面添加一个灰色半透（基本只是背景的级别）的窗口，这个窗口展示了fitting中的时间范围，当然这个窗口的左右可以被拖动（最好可以做一个加粗的线性边界以提示用户这两条线可以被拖动）
+我希望可以随着optimization的步进，在预览窗口与参数输出窗口里显示到目前为止最好的结果和参数
+然后添加暂停和终止功能。
+
+GUI右边预览界面添加几个按钮，一是“dimensional”，将视图单位设置为微米和微秒，一是“normalized”，以MATLAB代码里设置的逻辑将R和t无量纲化
+
+以上是GUI的需求，在性能方面，首先我当然希望这个optimization可以调用多线程（且不要像matlab一样过一会儿线程池就关了，就无法继续运行了），这个线程数可以放在settings的preference里。另外，matlab的patternsearch有一个问题，即每一个尝试都只调整一个参数，其余参数保持不变，这种策略保守，但是会导致optimization无法跳出local minimum，我不知道有没有算法可以跳出这个限制，如果有的话，请将其与传统的patternsearch algorithm一起都放进preference里。也请将patternsearch的各种选项：
+'patternsearch',...
+        'Display','iter', ...
+        'Algorithm','classic', ...          % clearer “Successful/Unsuccessful Poll” logging
+        'UseCompletePoll',true, ...
+        'PollMethod','GSSPositiveBasis2N', ...
+        'ScaleMesh',false, ...              % you already log-transform
+        'InitialMeshSize',0.1, ...
+        'MeshContractionFactor',0.4, ...
+        'MeshTolerance',1e-5, ...
+        'StepTolerance',1e-10, ...
+        'Cache','on','CacheTol',1e-12, ...
+        'UseParallel', true;
+都放进去
+
+
+针对不足的补充：
+1. 数据单位，我会重新规范读取的mat文件，不再直接读取ellipse_fitting_results。
+2. 进度条用ETA就可以了
+3. 对，对应的两个标量会传给LSQ误差。同时，t_fit_end还可以帮助缩短fitting中单个例子的t_span。你不需要管实验数据本身有没有被裁剪，实验数据的size本身就不完全一样
+4. normalized和dimensional只是用于展示的，不涉及任何计算逻辑。只是说我们在科研中对有无量纲的图样都感兴趣
+    规则：无论有没有量纲，t都同意用t_Rmax减去，然后t_nondim = (t - t_Rmax) / tc，R_nondim = R / Rmax
+5. “optimization 使用持久进程池，线程/进程数在 Settings 中配置”
+    保持当前 MATLAB 选项（UseCompletePoll、GSSPositiveBasis2N 等，同时也增加其它算法，如Differential Evolution、CMA-ES、或 scipy 的 dual_annealing/basinhopping，用于在 pattern search 陷入局部最小后尝试跳出。
+6. 就如你所说，分成两组，常用和高级设置
+
+不清楚的需求：
+1. 本构包的结构，按我的理解，本构包收到主函数给出的应变与应变率的信息，计算后得到stress integral再返回主函数。这样本构就被独立出来了，对吧？
+2. 同一套IMR方程，只是可选RP和KM，应该通过if切换就可以实现
+3. 右侧下半的参数输出应该为最佳拟合参数列表（随着拟合进行这里的参数列表应该被同步更新），LSQ vs iteration也放上。
+    需要将这些参数并同simulation产生的r-t curve一起导出为mat，具体格式可参见main_RT_optimization 201行：
+    save(save_option.save_name, 't_sim', 'R_sim', 'U_sim', 'P_sim', 't_sim_nondim', 'R_sim_nondim', 't_exp', 't_nondim_exp', 'R_exp', 'R_nondim_exp', 'struct_best_fit');
+4. 加载保存的格式我希望与现有的系统兼容，主要有两种格式，
+    一种只有参数，也就是fun_fitting_initialization.m所产生的格式，以struct的形式保存初始值，fitting上下限和fitting时步进的scale
+    说起上下限，我忘记在之前的需求里提了，参数输入界面应该也包含有上下限
+    另一种就是我刚刚已经提到的main_RT_optimization 201行，除了struct保存的fitting参数，还有实验和拟合的r-t curve
+5. 对，两个用同一个逻辑，fitting还要多fitting 上下限的信息
+6. 如果fitting中单个fitting失败，可以返回10^10的lsqerr，用于提示该处不可行

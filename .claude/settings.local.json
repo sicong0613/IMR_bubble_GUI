@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(rm \"imr_gui/imr/ptkd_solver.py\")",
+      "Bash(mv \"imr_gui/constitutive/ptkd.json\" \"imr_gui/constitutive/gmod.json\")",
+      "Bash(rm -f \"imr_gui/imr/__pycache__/ptkd_solver.cpython-311.pyc\")",
+      "Bash(python -c \"from imr_gui.app import MainWindow; print\\(''Import OK''\\)\")"
+    ]
+  }
+}
