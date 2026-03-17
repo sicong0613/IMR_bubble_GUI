@@ -26,6 +26,10 @@ class MplCanvas(FigureCanvas):
         self.setParent(parent)
         self.handles = PlotHandles()
 
+        # data bounds for zoom reference (set after each plot)
+        self._data_xlim: tuple | None = None
+        self._data_ylim: tuple | None = None
+
         self.ax.set_xlabel("t (s)")
         self.ax.set_ylabel("R (m)")
         self.ax.grid(True, alpha=0.3)
@@ -35,6 +39,11 @@ class MplCanvas(FigureCanvas):
         self._drag_callback: Callable[[str, float], None] | None = None
         self._pick_tolerance = 0.02  # fraction of x-axis range
         self._drag_xlim: tuple[float, float] | None = None  # clamp range
+
+        # pan state
+        self._pan_start: tuple | None = None   # (event.x, event.y) in display coords
+        self._pan_xlim: list | None = None
+        self._pan_ylim: list | None = None
 
         self.mpl_connect("button_press_event", self._on_press)
         self.mpl_connect("button_release_event", self._on_release)
@@ -55,50 +64,72 @@ class MplCanvas(FigureCanvas):
         if event.inaxes != self.ax or event.button != 1:
             return
         h = self.handles
-        if h.fit_window_vline_start is None and h.fit_window_vline_end is None:
-            return
 
-        xlim = self.ax.get_xlim()
-        tol = (xlim[1] - xlim[0]) * self._pick_tolerance
-        x = event.xdata
+        # Check if near a fit-window line first
+        if h.fit_window_vline_start is not None or h.fit_window_vline_end is not None:
+            xlim = self.ax.get_xlim()
+            tol = (xlim[1] - xlim[0]) * self._pick_tolerance
+            x = event.xdata
 
-        dist_start = dist_end = float("inf")
-        if h.fit_window_vline_start is not None:
-            dist_start = abs(x - h.fit_window_vline_start.get_xdata()[0])
-        if h.fit_window_vline_end is not None:
-            dist_end = abs(x - h.fit_window_vline_end.get_xdata()[0])
+            dist_start = dist_end = float("inf")
+            if h.fit_window_vline_start is not None:
+                dist_start = abs(x - h.fit_window_vline_start.get_xdata()[0])
+            if h.fit_window_vline_end is not None:
+                dist_end = abs(x - h.fit_window_vline_end.get_xdata()[0])
 
-        best = min(dist_start, dist_end)
-        if best > tol:
-            return
+            best = min(dist_start, dist_end)
+            if best <= tol:
+                self._drag_target = "start" if dist_start <= dist_end else "end"
+                return
 
-        self._drag_target = "start" if dist_start <= dist_end else "end"
+        # Not near a fit line — start pan
+        self._pan_start = (event.x, event.y)
+        self._pan_xlim = list(self.ax.get_xlim())
+        self._pan_ylim = list(self.ax.get_ylim())
 
     def _on_release(self, event):
         self._drag_target = None
+        self._pan_start = None
 
     def _on_motion(self, event):
-        if self._drag_target is None or event.inaxes != self.ax:
+        # --- fit-window line drag ---
+        if self._drag_target is not None:
+            if event.inaxes != self.ax:
+                return
+            x = event.xdata
+            if x is None:
+                return
+            if self._drag_xlim is not None:
+                x = max(self._drag_xlim[0], min(x, self._drag_xlim[1]))
+
+            vline = (
+                self.handles.fit_window_vline_start
+                if self._drag_target == "start"
+                else self.handles.fit_window_vline_end
+            )
+            if vline is not None:
+                vline.set_xdata([x, x])
+
+            self._update_fill_region()
+            self.draw_idle()
+
+            if self._drag_callback is not None:
+                self._drag_callback(self._drag_target, x)
             return
-        x = event.xdata
-        if x is None:
-            return
-        if self._drag_xlim is not None:
-            x = max(self._drag_xlim[0], min(x, self._drag_xlim[1]))
 
-        vline = (
-            self.handles.fit_window_vline_start
-            if self._drag_target == "start"
-            else self.handles.fit_window_vline_end
-        )
-        if vline is not None:
-            vline.set_xdata([x, x])
-
-        self._update_fill_region()
-        self.draw_idle()
-
-        if self._drag_callback is not None:
-            self._drag_callback(self._drag_target, x)
+        # --- pan ---
+        if self._pan_start is not None and event.x is not None:
+            dx_disp = event.x - self._pan_start[0]
+            dy_disp = event.y - self._pan_start[1]
+            xlim = self._pan_xlim
+            ylim = self._pan_ylim
+            bbox = self.ax.get_window_extent()
+            if bbox.width > 0 and bbox.height > 0:
+                dx_data = -dx_disp * (xlim[1] - xlim[0]) / bbox.width
+                dy_data = -dy_disp * (ylim[1] - ylim[0]) / bbox.height
+                self.ax.set_xlim(xlim[0] + dx_data, xlim[1] + dx_data)
+                self.ax.set_ylim(ylim[0] + dy_data, ylim[1] + dy_data)
+                self.draw_idle()
 
     def _update_fill_region(self):
         """Redraw the shaded region between the two vlines."""
@@ -199,3 +230,73 @@ class MplCanvas(FigureCanvas):
                 except Exception:
                     pass
                 setattr(self.handles, attr, None)
+
+    # ---- zoom support -------------------------------------------------------
+
+    def set_data_bounds(self, xlim: tuple, ylim: tuple):
+        """Store the full data bounds for zoom reference."""
+        self._data_xlim = xlim
+        self._data_ylim = ylim
+
+    def zoom_x(self, fraction: float):
+        """Zoom x-axis anchored at the left edge (x_min stays fixed)."""
+        if self._data_xlim is None:
+            return
+        x_left = self._data_xlim[0]
+        x_range = (self._data_xlim[1] - self._data_xlim[0]) * max(0.01, fraction)
+        self.ax.set_xlim(x_left, x_left + x_range)
+        self.draw_idle()
+
+    def zoom_y(self, fraction: float):
+        """Zoom y-axis anchored at the bottom edge (y_min stays fixed)."""
+        if self._data_ylim is None:
+            return
+        y_bottom = self._data_ylim[0]
+        y_range = (self._data_ylim[1] - self._data_ylim[0]) * max(0.01, fraction)
+        self.ax.set_ylim(y_bottom, y_bottom + y_range)
+        self.draw_idle()
+
+    def reset_zoom(self):
+        """Restore full data view."""
+        if self._data_xlim is not None:
+            self.ax.set_xlim(self._data_xlim)
+        if self._data_ylim is not None:
+            self.ax.set_ylim(self._data_ylim)
+        self.draw_idle()
+
+    def wheelEvent(self, event):  # noqa: N802
+        """Zoom in/out centered on mouse cursor (like MATLAB)."""
+        if self._data_xlim is None and self._data_ylim is None:
+            super().wheelEvent(event)
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+
+        factor = 0.85 if delta > 0 else 1.0 / 0.85
+        ax = self.ax
+        xlim = list(ax.get_xlim())
+        ylim = list(ax.get_ylim())
+
+        # Get mouse position in data coordinates
+        try:
+            pos = event.position()
+            x_pix = pos.x()
+            y_pix = pos.y()
+            # Convert Qt top-left origin to matplotlib bottom-left origin
+            y_mpl = self.height() - y_pix
+            x_data, y_data = ax.transData.inverted().transform((x_pix, y_mpl))
+            # Clamp to current view
+            x_data = max(xlim[0], min(x_data, xlim[1]))
+            y_data = max(ylim[0], min(y_data, ylim[1]))
+        except Exception:
+            x_data = (xlim[0] + xlim[1]) / 2
+            y_data = (ylim[0] + ylim[1]) / 2
+
+        new_xlim = [x_data + (x - x_data) * factor for x in xlim]
+        new_ylim = [y_data + (y - y_data) * factor for y in ylim]
+        ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
+        self.draw_idle()
+        event.accept()

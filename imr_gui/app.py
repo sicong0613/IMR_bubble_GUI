@@ -3,11 +3,13 @@ from __future__ import annotations
 import traceback
 from dataclasses import dataclass
 import time
+import math
+import re
 
 import numpy as np
 from scipy.io import loadmat, savemat
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QActionGroup
+from PySide6.QtGui import QActionGroup, QValidator
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -15,15 +17,18 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QProgressDialog,
     QScrollArea,
+    QSlider,
     QSplitter,
     QDialog,
     QDialogButtonBox,
@@ -56,6 +61,47 @@ class _NoWheelSpinBox(QDoubleSpinBox):
 
     def wheelEvent(self, event):  # noqa: N802
         event.ignore()
+
+
+class _SigFigSpinBox(_NoWheelSpinBox):
+    """QDoubleSpinBox that displays 4 significant figures, automatically using
+    scientific notation for very large or very small values."""
+
+    def textFromValue(self, val: float) -> str:  # noqa: N802
+        if val == 0.0:
+            return "0.000"
+        mag = abs(val)
+        if mag < 1e-3 or mag >= 1e4:
+            return f"{val:.3e}"
+        if mag >= 1.0:
+            digits_before = int(math.floor(math.log10(mag))) + 1
+            dec = max(0, 4 - digits_before)
+        else:
+            dec = int(-math.floor(math.log10(mag))) + 3
+        return f"{val:.{dec}f}"
+
+    def valueFromText(self, text: str) -> float:  # noqa: N802
+        try:
+            return float(text.strip())
+        except ValueError:
+            return 0.0
+
+    def validate(self, text: str, pos: int):  # noqa: N802
+        t = text.strip()
+        if not t or t in ("-", "+", ".", "-."):
+            return QValidator.State.Intermediate, text, pos
+        try:
+            val = float(t)
+            if self.minimum() <= val <= self.maximum():
+                return QValidator.State.Acceptable, text, pos
+            return QValidator.State.Intermediate, text, pos
+        except ValueError:
+            pass
+        # Allow partial scientific notation like "1e", "1e-", "1.5e+"
+        if re.fullmatch(r'[-+]?(\d+\.?\d*|\.\d+)[eE][-+]?\d*', t) or \
+           re.fullmatch(r'[-+]?(\d+\.?\d*|\.\d+)[eE]?', t):
+            return QValidator.State.Intermediate, text, pos
+        return QValidator.State.Invalid, text, pos
 
 
 class _SciNotationSpinBox:
@@ -352,9 +398,42 @@ class MainWindow(QMainWindow):
         self.spin_t_fit_start.valueChanged.connect(self._on_fit_window_changed)
         self.spin_t_fit_end.valueChanged.connect(self._on_fit_window_changed)
 
+        # Canvas wrapped with zoom sliders
+        canvas_area = QWidget()
+        canvas_grid = QGridLayout(canvas_area)
+        canvas_grid.setContentsMargins(0, 0, 0, 0)
+        canvas_grid.setSpacing(2)
+
+        self.slider_y_zoom = QSlider(Qt.Vertical)
+        self.slider_y_zoom.setRange(10, 100)
+        self.slider_y_zoom.setValue(100)
+        self.slider_y_zoom.setInvertedAppearance(True)  # top = more zoomed in
+        self.slider_y_zoom.setToolTip("Y-axis zoom: slide up to zoom in")
+
         self.canvas = MplCanvas()
         self.canvas.set_drag_callback(self._on_fit_window_dragged)
-        right_layout.addWidget(self.canvas, stretch=3)
+
+        self.slider_x_zoom = QSlider(Qt.Horizontal)
+        self.slider_x_zoom.setRange(10, 100)
+        self.slider_x_zoom.setValue(100)
+        self.slider_x_zoom.setToolTip("X-axis zoom: slide left to zoom in")
+
+        btn_reset_zoom = QPushButton("↺")
+        btn_reset_zoom.setFixedSize(24, 24)
+        btn_reset_zoom.setToolTip("Reset zoom to full view")
+        btn_reset_zoom.clicked.connect(self._on_reset_zoom)
+
+        canvas_grid.addWidget(self.slider_y_zoom, 0, 0)
+        canvas_grid.addWidget(self.canvas, 0, 1)
+        canvas_grid.addWidget(btn_reset_zoom, 1, 0)
+        canvas_grid.addWidget(self.slider_x_zoom, 1, 1)
+        canvas_grid.setColumnStretch(1, 1)
+        canvas_grid.setRowStretch(0, 1)
+
+        self.slider_x_zoom.valueChanged.connect(self._on_x_zoom_changed)
+        self.slider_y_zoom.valueChanged.connect(self._on_y_zoom_changed)
+
+        right_layout.addWidget(canvas_area, stretch=3)
 
         self.lbl_output = QPlainTextEdit()
         self.lbl_output.setReadOnly(True)
@@ -416,19 +495,13 @@ class MainWindow(QMainWindow):
             "LSODA: auto-switching Adams/BDF"
         )
 
-        self.spin_rtol = _NoWheelSpinBox()
-        self.spin_rtol.setRange(1e-14, 1e-1)
-        self.spin_rtol.setDecimals(0)
-        self.spin_rtol.setSpecialValueText("1e-8")
-        self.spin_rtol.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self._spin_rtol_line = _SciNotationSpinBox(self.spin_rtol, 1e-8)
+        self.le_rtol = QLineEdit("1e-8")
+        self.le_rtol.setToolTip("Relative tolerance for ODE solver (e.g. 1e-8)")
+        self.le_rtol.setPlaceholderText("e.g. 1e-8")
 
-        self.spin_atol = _NoWheelSpinBox()
-        self.spin_atol.setRange(1e-14, 1e-1)
-        self.spin_atol.setDecimals(0)
-        self.spin_atol.setSpecialValueText("1e-7")
-        self.spin_atol.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self._spin_atol_line = _SciNotationSpinBox(self.spin_atol, 1e-7)
+        self.le_atol = QLineEdit("1e-7")
+        self.le_atol.setToolTip("Absolute tolerance for ODE solver (e.g. 1e-7)")
+        self.le_atol.setPlaceholderText("e.g. 1e-7")
 
     def _show_physics_settings(self):
         """Open a modal dialog for P_inf, rho, NT, and solver settings."""
@@ -437,6 +510,16 @@ class MainWindow(QMainWindow):
             dlg.setWindowTitle("Physics Settings")
             dlg.setMinimumWidth(360)
             lay = QVBoxLayout(dlg)
+
+            warn_lbl = QLabel(
+                "⚠  Warning: do not modify unless you know what you are doing!"
+            )
+            warn_lbl.setStyleSheet(
+                "QLabel { color: #cc6600; font-weight: bold; padding: 4px; "
+                "border: 1px solid #cc6600; border-radius: 3px; }"
+            )
+            warn_lbl.setWordWrap(True)
+            lay.addWidget(warn_lbl)
 
             form = QFormLayout()
             form.addRow("P_inf (Pa):", self.spin_P_inf)
@@ -457,8 +540,8 @@ class MainWindow(QMainWindow):
             adv_form = QFormLayout(self._adv_solver_widget)
             adv_form.setContentsMargins(12, 0, 0, 0)
             adv_form.addRow("ODE solver:", self._cmb_solver)
-            adv_form.addRow("RelTol:", self.spin_rtol)
-            adv_form.addRow("AbsTol:", self.spin_atol)
+            adv_form.addRow("RelTol:", self.le_rtol)
+            adv_form.addRow("AbsTol:", self.le_atol)
             self._adv_solver_widget.setVisible(False)
             lay.addWidget(self._adv_solver_widget)
 
@@ -513,18 +596,30 @@ class MainWindow(QMainWindow):
         self._param_scroll.setWidget(content)
 
     def _add_param_row(self, p: ConstitutiveParameter, parent_layout: QVBoxLayout):
-        # --- value row ---
-        row = QHBoxLayout()
-        unit_label = p.units[0].label if p.units else ""
-        lbl_text = f"{p.label}" if not unit_label or unit_label == "-" else f"{p.label}"
-        row.addWidget(QLabel(lbl_text))
+        # Column widths — kept identical between both rows for alignment:
+        _W_LABEL = 46   # name label  ↔  Fit checkbox
+        _W_SPIN  = 82   # value spin  ↔  lb spin
+        _W_UNIT  = 64   # unit widget (shared column)
+        _W_SCALE = 60   # scale combo
+        _W_UB    = 16   # "ub" mini-label
+        _W_UB_SPIN = 68  # ub spinbox
 
-        spin = _NoWheelSpinBox()
+        # --- value row: [name | value_spin | unit | scale] ---
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.setContentsMargins(0, 0, 0, 0)
+
+        lbl = QLabel(p.label)
+        lbl.setFixedWidth(_W_LABEL)
+        row.addWidget(lbl)
+
+        spin = _SigFigSpinBox()
         spin.setRange(-1e15, 1e15)
-        spin.setDecimals(6)
+        spin.setDecimals(10)
         spin.setValue(p.default)
         spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        row.addWidget(spin, stretch=2)
+        spin.setFixedWidth(_W_SPIN)
+        row.addWidget(spin)
 
         unit_combo: QComboBox | None = None
         unit_options = list(p.units) if p.units else []
@@ -532,47 +627,64 @@ class MainWindow(QMainWindow):
             unit_combo = QComboBox()
             for u in unit_options:
                 unit_combo.addItem(u.label)
-            row.addWidget(unit_combo, stretch=1)
+            unit_combo.setFixedWidth(_W_UNIT)
+            row.addWidget(unit_combo)
             unit_combo.currentIndexChanged.connect(
                 lambda idx, name=p.name: self._on_unit_changed(name, idx)
             )
         elif unit_options:
-            row.addWidget(QLabel(unit_options[0].label))
+            lbl_unit = QLabel(unit_options[0].label)
+            lbl_unit.setFixedWidth(_W_UNIT)
+            row.addWidget(lbl_unit)
 
-        parent_layout.addLayout(row)
-
-        # --- fit controls row ---
-        fw = QWidget()
-        flay = QHBoxLayout(fw)
-        flay.setContentsMargins(20, 0, 0, 0)
-
-        chk = QCheckBox("Fit")
-        chk.setChecked(p.fit_default)
-        flay.addWidget(chk)
-
-        flay.addWidget(QLabel("lb"))
-        spin_lb = _NoWheelSpinBox()
-        spin_lb.setRange(-1e15, 1e15)
-        spin_lb.setDecimals(6)
-        spin_lb.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        spin_lb.setValue(p.lb)
-        flay.addWidget(spin_lb, stretch=1)
-
-        flay.addWidget(QLabel("ub"))
-        spin_ub = _NoWheelSpinBox()
-        spin_ub.setRange(-1e15, 1e15)
-        spin_ub.setDecimals(6)
-        spin_ub.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        spin_ub.setValue(p.ub)
-        flay.addWidget(spin_ub, stretch=1)
-
-        flay.addWidget(QLabel("scale"))
         cmb_scale = QComboBox()
         cmb_scale.addItems(["lin", "log"])
         if p.scale == "log":
             cmb_scale.setCurrentIndex(1)
-        flay.addWidget(cmb_scale)
+        cmb_scale.setFixedWidth(_W_SCALE)
+        row.addWidget(cmb_scale)
 
+        row.addStretch(1)
+        parent_layout.addLayout(row)
+
+        # --- fit controls row: [Fit | lb_spin | "ub" | ub_spin] ---
+        # Fit checkbox has the same fixed width as the name label above, so
+        # lb_spin starts at the exact same x-offset as value_spin. No "lb"
+        # label is needed — position makes it unambiguous.
+        fw = QWidget()
+        flay = QHBoxLayout(fw)
+        flay.setContentsMargins(0, 0, 0, 0)
+        flay.setSpacing(4)
+
+        chk = QCheckBox("Fit")
+        chk.setChecked(p.fit_default)
+        chk.setFixedWidth(_W_LABEL)          # ← matches name label width
+        flay.addWidget(chk)
+
+        spin_lb = _SigFigSpinBox()
+        spin_lb.setRange(-1e15, 1e15)
+        spin_lb.setDecimals(10)
+        spin_lb.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin_lb.setValue(p.lb)
+        spin_lb.setFixedWidth(_W_SPIN)       # ← matches value spin width
+        spin_lb.setToolTip("Lower bound (lb)")
+        flay.addWidget(spin_lb)
+
+        lbl_ub = QLabel("ub")
+        lbl_ub.setFixedWidth(_W_UB)
+        lbl_ub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        flay.addWidget(lbl_ub)
+
+        spin_ub = _SigFigSpinBox()
+        spin_ub.setRange(-1e15, 1e15)
+        spin_ub.setDecimals(10)
+        spin_ub.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin_ub.setValue(p.ub)
+        spin_ub.setFixedWidth(_W_UB_SPIN)
+        spin_ub.setToolTip("Upper bound (ub)")
+        flay.addWidget(spin_ub)
+
+        flay.addStretch(1)
         parent_layout.addWidget(fw)
 
         # store references
@@ -612,6 +724,7 @@ class MainWindow(QMainWindow):
 
         for fw in self._fit_widgets.values():
             fw["row_widget"].setEnabled(is_fitting)
+            fw["cmb_scale"].setEnabled(is_fitting)
 
         self._fit_window_widget.setVisible(is_fitting)
         self.btn_fit.setEnabled(is_fitting)
@@ -663,10 +776,18 @@ class MainWindow(QMainWindow):
     # --- build model-specific inputs ---
 
     def _get_solver_settings(self) -> dict:
+        try:
+            rtol = float(self.le_rtol.text())
+        except ValueError:
+            rtol = 1e-8
+        try:
+            atol = float(self.le_atol.text())
+        except ValueError:
+            atol = 1e-7
         return dict(
             solver_method=self._cmb_solver.currentText(),
-            rel_tol=self._spin_rtol_line.value(),
-            abs_tol=self._spin_atol_line.value(),
+            rel_tol=rtol,
+            abs_tol=atol,
         )
 
     def _build_sim_inputs(self, params: dict[str, float]):
@@ -828,6 +949,21 @@ class MainWindow(QMainWindow):
         spin.blockSignals(False)
 
     # =====================================================================
+    # zoom callbacks
+    # =====================================================================
+
+    def _on_x_zoom_changed(self, value: int):
+        self.canvas.zoom_x(value / 100.0)
+
+    def _on_y_zoom_changed(self, value: int):
+        self.canvas.zoom_y(value / 100.0)
+
+    def _on_reset_zoom(self):
+        self.slider_x_zoom.setValue(100)
+        self.slider_y_zoom.setValue(100)
+        self.canvas.reset_zoom()
+
+    # =====================================================================
     # redraw
     # =====================================================================
 
@@ -904,6 +1040,23 @@ class MainWindow(QMainWindow):
             self.canvas.draw_fit_window(min(t0_view, t1_view), max(t0_view, t1_view))
 
         self.canvas.draw_idle()
+
+        # Store data bounds for zoom, then apply current slider zoom
+        has_data = (
+            self.canvas.handles.exp_line is not None
+            or self.canvas.handles.sim_line is not None
+            or self.canvas.handles.fit_best_line is not None
+        )
+        if has_data:
+            xlim = self.canvas.ax.get_xlim()
+            ylim = self.canvas.ax.get_ylim()
+            self.canvas.set_data_bounds(xlim, ylim)
+            x_frac = self.slider_x_zoom.value() / 100.0
+            y_frac = self.slider_y_zoom.value() / 100.0
+            if x_frac < 0.999:
+                self.canvas.zoom_x(x_frac)
+            if y_frac < 0.999:
+                self.canvas.zoom_y(y_frac)
 
     # =====================================================================
     # load experiment
