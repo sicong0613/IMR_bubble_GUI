@@ -1,6 +1,6 @@
 {
-  "id": "GMOD",
-  "display_name": "Generalized Maxwell-Ogden + Damage (GMOD)",
+  "id": "GMOD2",
+  "display_name": "Generalized Maxwell-Ogden + Damage, 2-term (GMOD2)",
   "description": "Two equilibrium Ogden elastic branches (A1, A2), two non-equilibrium Maxwell branches (B1, B2) with viscous dashpot, and a binary damage model. Matches MATLAB fun_IMR_damage_Maxwell_Kelvin_KM.",
   "parameters": [
     {

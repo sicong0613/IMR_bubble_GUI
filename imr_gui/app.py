@@ -8,6 +8,11 @@ import re
 
 import numpy as np
 from scipy.io import loadmat, savemat
+try:
+    import mat73 as _mat73
+    _HAS_MAT73 = True
+except ImportError:
+    _HAS_MAT73 = False
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QActionGroup, QValidator
 from PySide6.QtWidgets import (
@@ -41,10 +46,11 @@ from PySide6.QtWidgets import (
 
 from imr_gui.imr import NhkvInputs, NhkvOutputs, simulate_nhkv_lic
 from imr_gui.imr import GMODInputs, simulate_gmod_lic
+from imr_gui.imr import GMOD1Inputs, simulate_gmod1_lic
 from imr_gui.io import load_experiment_mat
 from imr_gui.ui.mpl_canvas import MplCanvas
 from imr_gui.constitutive import (
-    load_nhkv_model, load_gmod_model,
+    load_nhkv_model,
     ConstitutiveParameter, ConstitutiveModel, AVAILABLE_MODELS,
 )
 from imr_gui.opt import FitConfig, FitProgress, FitResult, fit_nhkv_to_experiment
@@ -599,7 +605,7 @@ class MainWindow(QMainWindow):
         # Column widths — kept identical between both rows for alignment:
         _W_LABEL = 46   # name label  ↔  Fit checkbox
         _W_SPIN  = 82   # value spin  ↔  lb spin
-        _W_UNIT  = 64   # unit widget (shared column)
+        _W_UNIT  = 68   # unit widget (shared column)
         _W_SCALE = 60   # scale combo
         _W_UB    = 16   # "ub" mini-label
         _W_UB_SPIN = 68  # ub spinbox
@@ -809,7 +815,21 @@ class MainWindow(QMainWindow):
                 Req=Req, tspan=tspan, NT=NT,
                 P_inf=P_inf, rho=rho, **solver, **const_kw,
             )
-        else:  # GMOD
+        elif key == "GMOD1":
+            const_kw = {k: v for k, v in const.items()
+                        if k in GMOD1Inputs.__dataclass_fields__}
+            return GMOD1Inputs(
+                U0=params.get("U0", 100.0),
+                GA=params.get("GA", 8e6),
+                alpha=params.get("alpha", 1.0),
+                GB=params.get("GB", 1e4),
+                beta=params.get("beta", 1.0),
+                mu=params.get("mu", 0.226),
+                damage_index=params.get("damage_index", 0),
+                Req=Req, tspan=tspan, NT=NT,
+                P_inf=P_inf, rho=rho, **solver, **const_kw,
+            )
+        else:  # GMOD2
             const_kw = {k: v for k, v in const.items()
                         if k in GMODInputs.__dataclass_fields__}
             return GMODInputs(
@@ -830,7 +850,11 @@ class MainWindow(QMainWindow):
 
     def _get_simulate_fn(self):
         key = self._get_active_model_key()
-        return simulate_nhkv_lic if key == "NHKV" else simulate_gmod_lic
+        if key == "NHKV":
+            return simulate_nhkv_lic
+        if key == "GMOD1":
+            return simulate_gmod1_lic
+        return simulate_gmod_lic  # GMOD2
 
     def _make_sim_for_fit(self, params_si: dict, tspan: float):
         """Called by the fitting engine to run one simulation."""
@@ -851,7 +875,22 @@ class MainWindow(QMainWindow):
                 P_inf=P_inf, rho=rho, **solver, **const_kw,
             )
             return simulate_nhkv_lic(inp)
-        else:  # GMOD
+        elif key == "GMOD1":
+            const_kw = {k: v for k, v in const.items()
+                        if k in GMOD1Inputs.__dataclass_fields__}
+            inp = GMOD1Inputs(
+                U0=params_si.get("U0", 100.0),
+                GA=params_si.get("GA", 8e6),
+                alpha=params_si.get("alpha", 1.0),
+                GB=params_si.get("GB", 1e4),
+                beta=params_si.get("beta", 1.0),
+                mu=params_si.get("mu", 0.226),
+                damage_index=params_si.get("damage_index", 0),
+                Req=Req, tspan=tspan, NT=NT,
+                P_inf=P_inf, rho=rho, **solver, **const_kw,
+            )
+            return simulate_gmod1_lic(inp)
+        else:  # GMOD2
             const_kw = {k: v for k, v in const.items()
                         if k in GMODInputs.__dataclass_fields__}
             inp = GMODInputs(
@@ -1530,52 +1569,202 @@ class MainWindow(QMainWindow):
 
     def _load_params_from_path(self, path: str):
         try:
-            m = loadmat(path, squeeze_me=True, struct_as_record=False)
-            if "struct_best_fit" not in m:
-                raise ValueError("MAT file does not contain 'struct_best_fit'")
-            sb = m["struct_best_fit"]
-            flat = np.ravel(sb)
+            # --- load MAT file; try mat73 first (handles MATLAB string type),
+            #     fall back to scipy for older v5 files with char arrays ---
+            src: dict[str, dict] = {}
 
-            def _to_str(rec, field):
-                val = getattr(rec, field)
-                arr = np.asarray(val)
-                return str(arr.item()).strip() if arr.ndim == 0 else str(arr.squeeze()).strip()
+            def _build_src_mat73(path: str):
+                """Parse struct_best_fit via mat73 (HDF5 / v7.3 MAT files)."""
+                m = _mat73.loadmat(path)
+                if "struct_best_fit" not in m:
+                    raise ValueError("MAT file does not contain 'struct_best_fit'")
+                sb = m["struct_best_fit"]
+                # mat73 returns a struct array as a dict of lists:
+                #   {'name': [...], 'value': [...], 'lb': [...], ...}
+                names  = sb.get("name",  [])
+                vals   = sb.get("value", [])
+                lbs    = sb.get("lb",    [])
+                ubs    = sb.get("ub",    [])
+                scales = sb.get("scale", [])
+                result = {}
+                for i, raw_name in enumerate(names):
+                    try:
+                        name = str(raw_name).strip()
+                        result[name] = dict(
+                            value=float(vals[i])   if i < len(vals)   else 0.0,
+                            lb   =float(lbs[i])    if i < len(lbs)    else 0.0,
+                            ub   =float(ubs[i])    if i < len(ubs)    else 1e10,
+                            scale=str(scales[i]).strip() if i < len(scales) else "lin",
+                        )
+                    except Exception:
+                        pass
+                return result
 
-            def _to_float(rec, field):
-                val = getattr(rec, field)
-                arr = np.asarray(val).astype(float).ravel()
-                if arr.size == 0:
-                    raise ValueError(f"Field '{field}' is empty")
-                return float(arr[0])
+            def _build_src_scipy(path: str):
+                """Parse struct_best_fit via scipy (v5 MAT files).
+
+                Handles two cases:
+                  - char-array names: decoded directly.
+                  - MCOS string objects (modern MATLAB): names cannot be decoded;
+                    falls back to positional layout matching by struct entry count.
+                """
+                # Known struct layouts ordered by parameter position (from JSON).
+                # Used when MATLAB 'string' type blocks name decoding.
+                _LAYOUTS: dict[int, list[str]] = {
+                    11: ["U0", "GA1", "GA2", "alpha1", "alpha2",
+                         "GB1", "GB2", "beta1", "beta2", "mu", "damage_index"],
+                    7:  ["U0", "GA", "alpha", "GB", "beta", "mu", "damage_index"],
+                }
+
+                m = loadmat(path, squeeze_me=True, struct_as_record=False)
+                if "struct_best_fit" not in m:
+                    raise ValueError("MAT file does not contain 'struct_best_fit'")
+                sb   = m["struct_best_fit"]
+                flat = np.ravel(sb)
+
+                def _to_str(rec, field):
+                    val = getattr(rec, field)
+                    arr = np.asarray(val)
+                    return str(arr.item()).strip() if arr.ndim == 0 else str(arr.squeeze()).strip()
+
+                def _is_mcos(s: str) -> bool:
+                    return "MCOS" in s or s.startswith("(b'")
+
+                def _to_float(rec, field):
+                    val = getattr(rec, field)
+                    arr = np.asarray(val).astype(float).ravel()
+                    if arr.size == 0:
+                        raise ValueError(f"Field '{field}' is empty")
+                    return float(arr[0])
+
+                result = {}
+                for rec in flat:
+                    try:
+                        name = _to_str(rec, "name")
+                        if _is_mcos(name):
+                            continue        # MCOS string — handled below
+                        scale_raw = _to_str(rec, "scale")
+                        result[name] = dict(
+                            value=_to_float(rec, "value"),
+                            lb   =_to_float(rec, "lb"),
+                            ub   =_to_float(rec, "ub"),
+                            scale=scale_raw if not _is_mcos(scale_raw) else "lin",
+                        )
+                    except Exception:
+                        pass
+
+                # Positional fallback when MCOS blocked all name decoding
+                if not result:
+                    layout = _LAYOUTS.get(len(flat))
+                    if layout:
+                        for i, rec in enumerate(flat):
+                            if i >= len(layout):
+                                break
+                            try:
+                                name = layout[i]
+                                scale_raw = _to_str(rec, "scale")
+                                result[name] = dict(
+                                    value=_to_float(rec, "value"),
+                                    lb   =_to_float(rec, "lb"),
+                                    ub   =_to_float(rec, "ub"),
+                                    scale=scale_raw if not _is_mcos(scale_raw) else "lin",
+                                )
+                            except Exception:
+                                pass
+
+                return result
+
+            # Try mat73 first; if it fails or produces MCOS garbage, try scipy
+            loaded = False
+            if _HAS_MAT73:
+                try:
+                    src = _build_src_mat73(path)
+                    # Reject if any name looks like an MCOS object repr
+                    if src and not any("MCOS" in k for k in src):
+                        loaded = True
+                except Exception:
+                    pass
+            if not loaded:
+                src = _build_src_scipy(path)
 
             known_names = set(self._param_rows.keys())
+
+            def _stem(name: str) -> str:
+                """Strip trailing '1' or '2' to get the canonical parameter stem.
+                e.g. 'GA1' → 'GA', 'alpha2' → 'alpha', 'GA' → 'GA'."""
+                return name[:-1] if name and name[-1] in "12" else name
+
+            def _best_match(target: str) -> dict | None:
+                """Find the best source record for *target*.
+
+                Matching order:
+                  1. Exact name  (GA1 → GA1)
+                  2. Stem-based  (GA → GA1, alpha → alpha1, GA1 → GA)
+                  3. Zero-substitution: if best candidate has value 0,
+                     fall through to the next suffix variant
+                     (alpha1=0 → try alpha2, per user request).
+
+                For targets ending in '2' only exact or '2'-suffixed sources
+                are accepted, so loading a 1-term file into GMOD2 does NOT
+                overwrite the second-branch parameters.
+                """
+                # 1) exact match
+                if target in src:
+                    return src[target]
+
+                tgt_stem = _stem(target)
+                tgt_sfx = target[len(tgt_stem):]   # "", "1", or "2"
+
+                # '2'-suffix targets: only accept exact (handled above) or a
+                # same-stem '2'-suffixed source.  Never map bare/1-term params
+                # onto the second branch.
+                if tgt_sfx == "2":
+                    d = src.get(tgt_stem + "2")
+                    return d  # None if not present → spinbox keeps current value
+
+                # bare or '1'-suffix target: gather stem-matching candidates
+                # priority: '1'-suffix → bare-name → '2'-suffix
+                _PRIO = {"1": 0, "": 1, "2": 2}
+                candidates: list[tuple[int, dict]] = []
+                for sname, d in src.items():
+                    s_stem = _stem(sname)
+                    s_sfx = sname[len(s_stem):]
+                    if s_stem == tgt_stem:
+                        candidates.append((_PRIO.get(s_sfx, 9), d))
+
+                if not candidates:
+                    return None
+
+                candidates.sort(key=lambda x: x[0])
+
+                # Within each priority level prefer non-zero values;
+                # if the best priority is all zeros, fall through to next level
+                # (this is the alpha1=0 → alpha2 substitution).
+                current_prio = None
+                same_level: list[dict] = []
+                for prio, d in candidates:
+                    if prio != current_prio:
+                        non_zero = [x for x in same_level if x["value"] != 0.0]
+                        if non_zero:
+                            return non_zero[0]
+                        current_prio = prio
+                        same_level = []
+                    same_level.append(d)
+                # flush last level
+                non_zero = [x for x in same_level if x["value"] != 0.0]
+                if non_zero:
+                    return non_zero[0]
+                # all candidates are zero — return first anyway
+                return candidates[0][1]
+
             values: dict[str, float] = {}
             param_bounds: dict[str, dict] = {}
 
-            for rec in flat:
-                name = _to_str(rec, "name")
-                if name not in known_names:
-                    continue
-                value = _to_float(rec, "value")
-                lb = _to_float(rec, "lb")
-                ub = _to_float(rec, "ub")
-                scale = _to_str(rec, "scale")
-                values[name] = value
-                param_bounds[name] = {"lb": lb, "ub": ub, "scale": scale}
-
-            # fallback: positional mapping
-            if not values and flat.size >= len(known_names):
-                ordered = list(self._param_rows.keys())
-                for idx, target in enumerate(ordered):
-                    if idx >= flat.size:
-                        break
-                    rec = flat[idx]
-                    values[target] = _to_float(rec, "value")
-                    param_bounds[target] = {
-                        "lb": _to_float(rec, "lb"),
-                        "ub": _to_float(rec, "ub"),
-                        "scale": _to_str(rec, "scale"),
-                    }
+            for target in known_names:
+                d = _best_match(target)
+                if d is not None:
+                    values[target] = d["value"]
+                    param_bounds[target] = {"lb": d["lb"], "ub": d["ub"], "scale": d["scale"]}
 
             for name, val in values.items():
                 row = self._param_rows.get(name)
@@ -1595,7 +1784,15 @@ class MainWindow(QMainWindow):
                 self.state.param_bounds = param_bounds
                 self.statusBar().showMessage(f"Parameters loaded from {path}")
             else:
-                raise ValueError("Could not map struct_best_fit to current model parameters.")
+                src_names = sorted(src.keys())
+                tgt_names = sorted(known_names)
+                loader = "mat73" if (loaded and _HAS_MAT73) else "scipy"
+                raise ValueError(
+                    f"Could not map struct_best_fit to current model parameters "
+                    f"(loaded via {loader}).\n\n"
+                    f"MAT file names:      {src_names}\n\n"
+                    f"Current model needs: {tgt_names}"
+                )
         except Exception as e:
             QMessageBox.critical(self, "Load failed", f"{e}\n\n{traceback.format_exc()}")
 

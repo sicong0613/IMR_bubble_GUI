@@ -5,7 +5,10 @@
       "Bash(rm \"imr_gui/imr/ptkd_solver.py\")",
       "Bash(mv \"imr_gui/constitutive/ptkd.json\" \"imr_gui/constitutive/gmod.json\")",
       "Bash(rm -f \"imr_gui/imr/__pycache__/ptkd_solver.cpython-311.pyc\")",
-      "Bash(python -c \"from imr_gui.app import MainWindow; print\\(''Import OK''\\)\")"
+      "Bash(python -c \"from imr_gui.app import MainWindow; print\\(''Import OK''\\)\")",
+      "Bash(py -3.11 -c \"import h5py; print\\(''h5py:'', h5py.__version__\\)\")",
+      "Bash(py -3.11 -c \"import mat73; print\\(''mat73:'', mat73.__version__\\)\")",
+      "Bash(py -3.11 -m pip show PySide6 scipy numpy mat73)"
     ]
   }
 }
