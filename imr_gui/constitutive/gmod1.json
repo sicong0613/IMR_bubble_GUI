@@ -1,0 +1,102 @@
+{
+  "id": "GMOD1",
+  "display_name": "Generalized Maxwell-Ogden + Damage, 1-term (GMOD1)",
+  "description": "Single equilibrium Ogden elastic branch (A), single non-equilibrium Maxwell branch (B) with viscous dashpot, and a binary damage model.",
+  "parameters": [
+    {
+      "name": "U0",
+      "label": "U0",
+      "units": [{ "label": "m/s", "factor": 1.0 }],
+      "default": 100.0,
+      "lb": 80.0,
+      "ub": 120.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "GA",
+      "label": "GA",
+      "units": [
+        { "label": "Pa",  "factor": 1.0 },
+        { "label": "kPa", "factor": 1e3 },
+        { "label": "MPa", "factor": 1e6 }
+      ],
+      "default": 8.0e6,
+      "lb": 1e3,
+      "ub": 2e7,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "alpha",
+      "label": "α",
+      "units": [{ "label": "-", "factor": 1.0 }],
+      "default": 1.0,
+      "lb": 0.5,
+      "ub": 3.0,
+      "scale": "lin",
+      "fit_default": false
+    },
+    {
+      "name": "GB",
+      "label": "GB",
+      "units": [
+        { "label": "Pa",  "factor": 1.0 },
+        { "label": "kPa", "factor": 1e3 },
+        { "label": "MPa", "factor": 1e6 }
+      ],
+      "default": 1e4,
+      "lb": 1e3,
+      "ub": 2e7,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "beta",
+      "label": "β",
+      "units": [{ "label": "-", "factor": 1.0 }],
+      "default": 1.0,
+      "lb": 0.5,
+      "ub": 3.0,
+      "scale": "lin",
+      "fit_default": false
+    },
+    {
+      "name": "mu",
+      "label": "μ",
+      "units": [{ "label": "Pa·s", "factor": 1.0 }],
+      "default": 0.226,
+      "lb": 0.01,
+      "ub": 1e2,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "damage_index",
+      "label": "damage idx",
+      "units": [{ "label": "-", "factor": 1.0 }],
+      "default": 0,
+      "lb": 0,
+      "ub": 200,
+      "scale": "lin",
+      "fit_default": false
+    }
+  ],
+  "constants": {
+    "_comment": "Non-fittable physical constants (same as NHKV/GMOD2).",
+    "T_inf":  298.15,
+    "c_long": 1485.0,
+    "gamma":  0.056,
+    "D0":     24.2e-6,
+    "kappa":  1.4,
+    "Ru":     8.3144598,
+    "A_therm": 5.28e-5,
+    "B_therm": 0.0117,
+    "P_ref":  1.17e11,
+    "T_ref":  5200.0,
+    "M_vapor": 0.01801528,
+    "M_air":  0.028966,
+    "MT":     200,
+    "xi_constant": -1.0
+  }
+}
