@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import traceback
 from dataclasses import dataclass
 import time
@@ -53,7 +54,11 @@ from imr_gui.constitutive import (
     load_nhkv_model,
     ConstitutiveParameter, ConstitutiveModel, AVAILABLE_MODELS,
 )
-from imr_gui.opt import FitConfig, FitProgress, FitResult, fit_nhkv_to_experiment
+from imr_gui.opt import (
+    OptConfig, FitConfig, FitProgress, FitResult,
+    fit_nhkv_to_experiment,
+    AVAILABLE_METHODS, DE_STRATEGIES, _HAS_CMA,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +166,68 @@ class AppState:
 
 
 # ---------------------------------------------------------------------------
+# picklable simulation specification (for DE multiprocessing)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SimSpec:
+    """All data needed to run one simulation — fully picklable (no Qt refs)."""
+    model_key: str
+    Req: float
+    NT: int
+    P_inf: float
+    rho: float
+    const: dict
+    solver: dict
+
+
+def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
+    """Module-level dispatch function — picklable for ProcessPoolExecutor workers."""
+    key = spec.model_key
+    if key == "NHKV":
+        const_kw = {k: v for k, v in spec.const.items()
+                    if k in NhkvInputs.__dataclass_fields__}
+        return simulate_nhkv_lic(NhkvInputs(
+            U0=params_si["U0"], G=params_si["G"], mu=params_si["mu"],
+            Req=spec.Req, tspan=tspan, NT=spec.NT,
+            P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
+        ))
+    elif key == "GMOD1":
+        const_kw = {k: v for k, v in spec.const.items()
+                    if k in GMOD1Inputs.__dataclass_fields__}
+        return simulate_gmod1_lic(GMOD1Inputs(
+            U0=params_si.get("U0", 100.0),
+            GA=params_si.get("GA", 8e6),
+            alpha=params_si.get("alpha", 1.0),
+            GB=params_si.get("GB", 1e4),
+            beta=params_si.get("beta", 1.0),
+            mu=params_si.get("mu", 0.226),
+            damage_index=params_si.get("damage_index", 0),
+            Req=spec.Req, tspan=tspan, NT=spec.NT,
+            P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
+        ))
+    else:  # GMOD2
+        const_kw = {k: v for k, v in spec.const.items()
+                    if k in GMODInputs.__dataclass_fields__}
+        return simulate_gmod_lic(GMODInputs(
+            U0=params_si.get("U0", 100.0),
+            GA1=params_si.get("GA1", 8e6),
+            GA2=params_si.get("GA2", 1e-10),
+            alpha1=params_si.get("alpha1", 1.0),
+            alpha2=params_si.get("alpha2", 1.0),
+            GB1=params_si.get("GB1", 1e4),
+            GB2=params_si.get("GB2", 1e-10),
+            beta1=params_si.get("beta1", 1.0),
+            beta2=params_si.get("beta2", 1.0),
+            mu=params_si.get("mu", 0.226),
+            damage_index=params_si.get("damage_index", 0),
+            Req=spec.Req, tspan=tspan, NT=spec.NT,
+            P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
+        ))
+
+
+# ---------------------------------------------------------------------------
 # workers
 # ---------------------------------------------------------------------------
 
@@ -189,13 +256,14 @@ class FitWorker(QThread):
     progress = Signal(object)
 
     def __init__(self, cfg, bounds_si, fit_flags, scales, initial_values,
-                 parent=None):
+                 opt_config: "OptConfig | None" = None, parent=None):
         super().__init__(parent)
         self._cfg = cfg
         self._bounds_si = bounds_si
         self._fit_flags = fit_flags
         self._scales = scales
         self._initial_values = initial_values
+        self._opt_config = opt_config or OptConfig()
         self._stop_requested = False
 
     def request_stop(self):
@@ -212,6 +280,7 @@ class FitWorker(QThread):
                 initial_values=self._initial_values,
                 progress_callback=lambda p: self.progress.emit(p),
                 stop_flag=lambda: self._stop_requested,
+                opt_config=self._opt_config,
             )
             self.finished_ok.emit(res)
         except Exception as e:
@@ -243,6 +312,7 @@ class MainWindow(QMainWindow):
         self._fit_timer.setInterval(500)
         self._fit_timer.timeout.connect(self._update_fit_progress)
         self._fit_start_time: float | None = None
+        self._opt_config: OptConfig = OptConfig()
 
         # model state
         self._current_model: ConstitutiveModel | None = None
@@ -289,7 +359,8 @@ class MainWindow(QMainWindow):
         act_phys_settings.triggered.connect(self._show_physics_settings)
 
         settings_menu = self.menuBar().addMenu("Settings")
-        settings_menu.addAction("Parallelism / Optimizer (coming soon)").setEnabled(False)
+        act_opt_settings = settings_menu.addAction("Optimizer Settings...")
+        act_opt_settings.triggered.connect(self._show_optimizer_settings)
 
     # =====================================================================
     # UI build
@@ -569,6 +640,305 @@ class MainWindow(QMainWindow):
         )
 
     # =====================================================================
+    # Optimizer Settings dialog
+    # =====================================================================
+
+    def _show_optimizer_settings(self):
+        """Open the Optimizer Settings dialog (built once, reused)."""
+        if not hasattr(self, "_opt_dlg"):
+            self._build_optimizer_settings_dlg()
+        self._opt_dlg_load()   # sync widgets → self._opt_config
+        self._opt_dlg.exec()
+
+    def _build_optimizer_settings_dlg(self):
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QFormLayout,
+            QComboBox, QSpinBox, QCheckBox,
+            QGroupBox, QStackedWidget, QLabel, QDialogButtonBox,
+            QWidget,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Optimizer Settings")
+        dlg.setMinimumWidth(420)
+        root = QVBoxLayout(dlg)
+
+        # ── Algorithm ──────────────────────────────────────────────────
+        form_top = QFormLayout()
+        self._cmb_opt_method = QComboBox()
+        methods = [m for m in AVAILABLE_METHODS
+                   if m != "CMA-ES" or _HAS_CMA]
+        self._cmb_opt_method.addItems(methods)
+        form_top.addRow("Algorithm:", self._cmb_opt_method)
+        root.addLayout(form_top)
+
+        # ── Shared options ─────────────────────────────────────────────
+        grp_shared = QGroupBox("General")
+        fs = QFormLayout(grp_shared)
+
+        self._spin_opt_workers = QSpinBox()
+        self._spin_opt_workers.setRange(1, 64)
+        self._spin_opt_workers.setToolTip(
+            "Parallel workers for Differential Evolution and Pattern Search.\n"
+            "Uses multiprocessing (separate processes, no GIL limit).\n"
+            "Set >1 only for these two algorithms."
+        )
+        fs.addRow("Workers (DE / PS):", self._spin_opt_workers)
+
+        self._spin_opt_maxfev = QSpinBox()
+        self._spin_opt_maxfev.setRange(10, 100_000)
+        self._spin_opt_maxfev.setSingleStep(100)
+        fs.addRow("Max evaluations:", self._spin_opt_maxfev)
+
+        self._spin_opt_xtol = _SigFigSpinBox()
+        self._spin_opt_xtol.setRange(1e-12, 1.0)
+        self._spin_opt_xtol.setDecimals(6)
+        fs.addRow("Parameter tol (xatol):", self._spin_opt_xtol)
+
+        self._spin_opt_ftol = _SigFigSpinBox()
+        self._spin_opt_ftol.setRange(1e-12, 1e6)
+        self._spin_opt_ftol.setDecimals(6)
+        fs.addRow("Function tol (fatol):", self._spin_opt_ftol)
+
+        root.addWidget(grp_shared)
+
+        # ── Per-algorithm stacked panel ────────────────────────────────
+        self._opt_stack = QStackedWidget()
+
+        # page 0 – Nelder-Mead
+        pg_nm = QWidget()
+        fnm = QFormLayout(pg_nm)
+        self._chk_nm_adaptive = QCheckBox("Adaptive simplex")
+        self._chk_nm_adaptive.setToolTip(
+            "Scales simplex parameters to the number of dimensions.\n"
+            "Recommended for >2 fitting parameters."
+        )
+        fnm.addRow("", self._chk_nm_adaptive)
+        self._opt_stack.addWidget(pg_nm)        # index 0
+
+        # page 1 – Powell
+        pg_pw = QWidget()
+        fpw = QFormLayout(pg_pw)
+        lbl_pw_warn = QLabel(
+            "⚠ Powell performs one line-search per parameter per iteration.\n"
+            "With expensive ODE solves this can take several minutes per\n"
+            "iteration. Consider Nelder-Mead or DE for IMR fitting."
+        )
+        lbl_pw_warn.setWordWrap(True)
+        fpw.addRow(lbl_pw_warn)
+        self._opt_stack.addWidget(pg_pw)        # index 1
+
+        # page 2 – Pattern Search
+        pg_ps = QWidget()
+        fps = QFormLayout(pg_ps)
+        self._chk_ps_complete = QCheckBox("Complete polling")
+        self._chk_ps_complete.setToolTip(
+            "If checked: evaluate all 2N directions before accepting.\n"
+            "If unchecked (default): accept first improvement found (faster).\n"
+            "Matches MATLAB patternsearch CompletePoll='off' default."
+        )
+        fps.addRow("", self._chk_ps_complete)
+        self._spin_ps_mesh_init = _SigFigSpinBox()
+        self._spin_ps_mesh_init.setRange(1e-4, 10.0)
+        self._spin_ps_mesh_init.setDecimals(4)
+        self._spin_ps_mesh_init.setToolTip(
+            "Initial mesh size relative to each parameter's optimizer-space range."
+        )
+        fps.addRow("Initial mesh size:", self._spin_ps_mesh_init)
+        self._spin_ps_expand = _SigFigSpinBox()
+        self._spin_ps_expand.setRange(1.01, 10.0)
+        self._spin_ps_expand.setDecimals(4)
+        self._spin_ps_expand.setToolTip("Mesh expansion factor on success (MATLAB default: 2.0).")
+        fps.addRow("Mesh expansion:", self._spin_ps_expand)
+        self._spin_ps_contract = _SigFigSpinBox()
+        self._spin_ps_contract.setRange(0.01, 0.99)
+        self._spin_ps_contract.setDecimals(4)
+        self._spin_ps_contract.setToolTip("Mesh contraction factor on failure (MATLAB default: 0.5).")
+        fps.addRow("Mesh contraction:", self._spin_ps_contract)
+        self._spin_ps_search = QSpinBox()
+        self._spin_ps_search.setRange(0, 10000)
+        self._spin_ps_search.setToolTip(
+            "Random points sampled before each poll step (search step).\n"
+            "0 = no search, pure GPS polling."
+        )
+        fps.addRow("Search points:", self._spin_ps_search)
+        self._opt_stack.addWidget(pg_ps)        # index 2
+
+        # page 3 – Differential Evolution
+        pg_de = QWidget()
+        fde = QFormLayout(pg_de)
+        self._cmb_de_strategy = QComboBox()
+        self._cmb_de_strategy.addItems(DE_STRATEGIES)
+        fde.addRow("Strategy:", self._cmb_de_strategy)
+        self._spin_de_maxiter = QSpinBox()
+        self._spin_de_maxiter.setRange(1, 10_000)
+        fde.addRow("Max iterations:", self._spin_de_maxiter)
+        self._spin_de_popsize = QSpinBox()
+        self._spin_de_popsize.setRange(2, 200)
+        fde.addRow("Population size:", self._spin_de_popsize)
+        self._spin_de_mutation = _SigFigSpinBox()
+        self._spin_de_mutation.setRange(0.0, 2.0)
+        self._spin_de_mutation.setDecimals(3)
+        fde.addRow("Mutation (F):", self._spin_de_mutation)
+        self._spin_de_recombination = _SigFigSpinBox()
+        self._spin_de_recombination.setRange(0.0, 1.0)
+        self._spin_de_recombination.setDecimals(3)
+        fde.addRow("Recombination (CR):", self._spin_de_recombination)
+        self._opt_stack.addWidget(pg_de)        # index 3
+
+        # page 4 – CMA-ES (only present if cma installed)
+        if _HAS_CMA:
+            pg_cma = QWidget()
+            fcma = QFormLayout(pg_cma)
+            self._spin_cma_sigma0 = _SigFigSpinBox()
+            self._spin_cma_sigma0.setRange(1e-6, 10.0)
+            self._spin_cma_sigma0.setDecimals(4)
+            self._spin_cma_sigma0.setToolTip(
+                "Initial step size in normalised [0,1] parameter space."
+            )
+            fcma.addRow("Initial σ₀:", self._spin_cma_sigma0)
+            self._spin_cma_maxfev = QSpinBox()
+            self._spin_cma_maxfev.setRange(10, 100_000)
+            self._spin_cma_maxfev.setSingleStep(100)
+            fcma.addRow("Max evaluations:", self._spin_cma_maxfev)
+            self._opt_stack.addWidget(pg_cma)   # index 4
+            _cma_page_idx = 4
+        else:
+            _cma_page_idx = -1
+
+        # page for Dual Annealing
+        pg_da = QWidget()
+        fda = QFormLayout(pg_da)
+        self._spin_da_maxfev = QSpinBox()
+        self._spin_da_maxfev.setRange(10, 100_000)
+        self._spin_da_maxfev.setSingleStep(100)
+        fda.addRow("Max evaluations:", self._spin_da_maxfev)
+        self._spin_da_temp = _SigFigSpinBox()
+        self._spin_da_temp.setRange(0.1, 50_000.0)
+        self._spin_da_temp.setDecimals(1)
+        fda.addRow("Initial temperature:", self._spin_da_temp)
+        self._spin_da_restart = _SigFigSpinBox()
+        self._spin_da_restart.setRange(1e-10, 1.0)
+        self._spin_da_restart.setDecimals(8)
+        self._spin_da_restart.setToolTip(
+            "Restart temperature ratio (fraction of initial temp)."
+        )
+        fda.addRow("Restart temp ratio:", self._spin_da_restart)
+        _da_page_idx = self._opt_stack.count()
+        self._opt_stack.addWidget(pg_da)
+
+        # page for Basin Hopping
+        pg_bh = QWidget()
+        fbh = QFormLayout(pg_bh)
+        self._spin_bh_niter = QSpinBox()
+        self._spin_bh_niter.setRange(1, 10_000)
+        fbh.addRow("Iterations:", self._spin_bh_niter)
+        self._spin_bh_step = _SigFigSpinBox()
+        self._spin_bh_step.setRange(1e-6, 10.0)
+        self._spin_bh_step.setDecimals(4)
+        self._spin_bh_step.setToolTip(
+            "Step size for the random displacement in normalised space."
+        )
+        fbh.addRow("Step size:", self._spin_bh_step)
+        _bh_page_idx = self._opt_stack.count()
+        self._opt_stack.addWidget(pg_bh)
+
+        # map method name → stack page index
+        self._opt_page_map = {
+            "Nelder-Mead": 0,
+            "Powell": 1,
+            "Pattern Search": 2,
+            "Differential Evolution": 3,
+            "CMA-ES": _cma_page_idx if _HAS_CMA else 0,
+            "Dual Annealing": _da_page_idx,
+            "Basin Hopping": _bh_page_idx,
+        }
+
+        root.addWidget(self._opt_stack)
+
+        # ── switch stack page when algorithm changes ───────────────────
+        def _on_method_changed(text):
+            idx = self._opt_page_map.get(text, 0)
+            self._opt_stack.setCurrentIndex(idx)
+            # workers only useful for DE and Pattern Search
+            self._spin_opt_workers.setEnabled(
+                text in ("Differential Evolution", "Pattern Search")
+            )
+
+        self._cmb_opt_method.currentTextChanged.connect(_on_method_changed)
+
+        # ── buttons ────────────────────────────────────────────────────
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(lambda: (self._opt_dlg_save(), dlg.accept()))
+        btn_box.rejected.connect(dlg.reject)
+        root.addWidget(btn_box)
+
+        self._opt_dlg = dlg
+
+    def _opt_dlg_load(self):
+        """Sync GUI widgets from self._opt_config."""
+        c = self._opt_config
+        idx = self._cmb_opt_method.findText(c.method)
+        if idx >= 0:
+            self._cmb_opt_method.setCurrentIndex(idx)
+        self._spin_opt_workers.setValue(c.n_workers)
+        self._spin_opt_maxfev.setValue(c.max_fev)
+        self._spin_opt_xtol.setValue(c.x_tol)
+        self._spin_opt_ftol.setValue(c.f_tol)
+        self._chk_nm_adaptive.setChecked(c.nm_adaptive)
+        self._chk_ps_complete.setChecked(c.ps_complete_poll)
+        self._spin_ps_mesh_init.setValue(c.ps_initial_mesh)
+        self._spin_ps_expand.setValue(c.ps_mesh_expansion)
+        self._spin_ps_contract.setValue(c.ps_mesh_contraction)
+        self._spin_ps_search.setValue(c.ps_search_pts)
+        self._cmb_de_strategy.setCurrentText(c.de_strategy)
+        self._spin_de_maxiter.setValue(c.de_maxiter)
+        self._spin_de_popsize.setValue(c.de_popsize)
+        self._spin_de_mutation.setValue(c.de_mutation)
+        self._spin_de_recombination.setValue(c.de_recombination)
+        if _HAS_CMA:
+            self._spin_cma_sigma0.setValue(c.cma_sigma0)
+            self._spin_cma_maxfev.setValue(c.cma_maxfev)
+        self._spin_da_maxfev.setValue(c.da_maxfev)
+        self._spin_da_temp.setValue(c.da_initial_temp)
+        self._spin_da_restart.setValue(c.da_restart_temp)
+        self._spin_bh_niter.setValue(c.bh_n_iter)
+        self._spin_bh_step.setValue(c.bh_stepsize)
+        # trigger page switch
+        self._cmb_opt_method.currentTextChanged.emit(c.method)
+
+    def _opt_dlg_save(self):
+        """Read GUI widgets back into self._opt_config."""
+        c = self._opt_config
+        c.method = self._cmb_opt_method.currentText()
+        c.n_workers = self._spin_opt_workers.value()
+        c.max_fev = self._spin_opt_maxfev.value()
+        c.x_tol = self._spin_opt_xtol.value()
+        c.f_tol = self._spin_opt_ftol.value()
+        c.nm_adaptive = self._chk_nm_adaptive.isChecked()
+        c.ps_complete_poll = self._chk_ps_complete.isChecked()
+        c.ps_initial_mesh = self._spin_ps_mesh_init.value()
+        c.ps_mesh_expansion = self._spin_ps_expand.value()
+        c.ps_mesh_contraction = self._spin_ps_contract.value()
+        c.ps_search_pts = self._spin_ps_search.value()
+        c.de_strategy = self._cmb_de_strategy.currentText()
+        c.de_maxiter = self._spin_de_maxiter.value()
+        c.de_popsize = self._spin_de_popsize.value()
+        c.de_mutation = self._spin_de_mutation.value()
+        c.de_recombination = self._spin_de_recombination.value()
+        if _HAS_CMA:
+            c.cma_sigma0 = self._spin_cma_sigma0.value()
+            c.cma_maxfev = self._spin_cma_maxfev.value()
+        c.da_maxfev = self._spin_da_maxfev.value()
+        c.da_initial_temp = self._spin_da_temp.value()
+        c.da_restart_temp = self._spin_da_restart.value()
+        c.bh_n_iter = self._spin_bh_niter.value()
+        c.bh_stepsize = self._spin_bh_step.value()
+
+    # =====================================================================
     # dynamic parameter panel
     # =====================================================================
 
@@ -582,6 +952,13 @@ class MainWindow(QMainWindow):
         self._param_box.setTitle(f"Parameters ({model.display_name})")
         self._rebuild_param_panel(model)
         self._set_mode(self.state.mode)  # refresh fit-control visibility
+        # GMOD models require much tighter ODE tolerances than NHKV.
+        if model_key in ("GMOD1", "GMOD2"):
+            self.le_rtol.setText("1e-9")
+            self.le_atol.setText("1e-9")
+        else:
+            self.le_rtol.setText("1e-8")
+            self.le_atol.setText("1e-7")
 
     def _rebuild_param_panel(self, model: ConstitutiveModel):
         # tear down existing rows
@@ -1297,13 +1674,6 @@ class MainWindow(QMainWindow):
         if self.state.exp_t is None or self.state.exp_R is None:
             QMessageBox.warning(self, "No data", "Please load experiment data before fitting.")
             return
-        if self.state.R_eq is None or self.state.P_inf is None or self.state.rho is None:
-            QMessageBox.warning(
-                self, "Missing physics",
-                "Please load data containing R_eq, Pinf and rho.",
-            )
-            return
-
         param_names = list(self._param_rows.keys())
         fit_flags: dict[str, bool] = {}
         scales: dict[str, str] = {}
@@ -1349,10 +1719,20 @@ class MainWindow(QMainWindow):
             )
             return
 
+        sim_spec = _SimSpec(
+            model_key=self._get_active_model_key(),
+            Req=float(self.spin_Req_um.value()) * 1e-6,
+            NT=int(self.spin_NT.value()),
+            P_inf=float(self.spin_P_inf.value()),
+            rho=float(self.spin_rho.value()),
+            const=dict(self._model_constants),
+            solver=self._get_solver_settings(),
+        )
         cfg = FitConfig(
             t_exp=t_windowed,
             R_exp=R_windowed,
             make_sim=self._make_sim_for_fit,
+            mp_make_sim=functools.partial(_sim_spec_call, sim_spec),
             param_names=param_names,
         )
 
@@ -1366,7 +1746,8 @@ class MainWindow(QMainWindow):
         self._redraw_all()
 
         self._fit_worker = FitWorker(
-            cfg, bounds_si, fit_flags, scales, initial_values, self,
+            cfg, bounds_si, fit_flags, scales, initial_values,
+            opt_config=self._opt_config, parent=self,
         )
 
         model_key = self._get_active_model_key()

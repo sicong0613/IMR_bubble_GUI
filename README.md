@@ -14,7 +14,17 @@ A Python desktop application for inertial microrheology (IMR) bubble simulation 
 
 - **Forward simulation** — run a Keller-Miksis bubble dynamics simulation for the selected model and compare against experimental `R(t)` data.
 
-- **Parameter fitting** — least-squares curve fitting (Nelder-Mead / L-BFGS-B) with configurable bounds and log/linear scale per parameter.
+- **Parameter fitting** — least-squares curve fitting with seven optimization algorithms:
+  - **Nelder-Mead** — fast local search, good for well-conditioned problems
+  - **Powell** — derivative-free directional search
+  - **Pattern Search** — GPS (GPSPositiveBasis2N), equivalent to MATLAB's `patternsearch`; best accuracy in practice
+  - **Differential Evolution** — global stochastic search; supports true multiprocessing
+  - **CMA-ES** — covariance matrix adaptation evolution strategy (requires optional `cma` package)
+  - **Dual Annealing** — simulated annealing + local search
+  - **Basin Hopping** — stochastic global search with local minimization
+  - Per-algorithm settings (bounds, tolerances, population size, mesh parameters, etc.) in the Optimizer Settings dialog.
+
+- **Parallel fitting** — Pattern Search and Differential Evolution support `n_workers > 1` for true multiprocessing (bypasses the Python GIL via `ProcessPoolExecutor`). Recommended for GMOD1/GMOD2 which have expensive ODE evaluations.
 
 - **Load / Save parameters** — import fitted parameters from MATLAB `struct_best_fit` MAT files (supports both v5 char-array names and modern MATLAB `string` type via positional layout matching). Save current parameters back to `.mat`.
 
@@ -23,6 +33,8 @@ A Python desktop application for inertial microrheology (IMR) bubble simulation 
 - **Unit display** — spinboxes support Pa / kPa / MPa for stiffness, µs/µm for time and radius.
 
 - **Plot controls** — zoom, time window, normalization toggle (R/Req), experimental data overlay.
+
+- **Auto ODE tolerance** — switching to GMOD1/GMOD2 automatically sets `rtol = atol = 1e-9` (required for accurate resolution of the stiff Maxwell branch); switching to NHKV uses `1e-8 / 1e-7`.
 
 ---
 
@@ -37,6 +49,12 @@ A Python desktop application for inertial microrheology (IMR) bubble simulation 
 
 ```bash
 pip install -r requirements.txt
+```
+
+For CMA-ES support (optional):
+
+```bash
+pip install cma
 ```
 
 ---
@@ -59,7 +77,7 @@ py -3.11 -m imr_gui
 
 File → Load experiment data (.mat)
 
-Expects a `.mat` file with 1-D arrays named `t` (seconds) and `R` (meters). Falls back to positional detection if exact names are not found.
+Expects a `.mat` file with 1-D arrays named `t` (seconds) and `R` (meters). Falls back to positional detection if exact names are not found. Time is automatically shifted so that the interpolated R-peak sits at t = 0.
 
 ---
 
@@ -79,6 +97,20 @@ Expects a `.mat` file containing a `struct_best_fit` array with fields `name`, `
 
 ---
 
+## ODE solver tolerances
+
+GMOD1 and GMOD2 are significantly stiffer than NHKV due to the Maxwell branch (`λ_nv`) ODEs (MT = 200 material points). The BDF solver requires tight tolerances to correctly resolve these dynamics:
+
+| Model | Recommended rtol | Recommended atol |
+|-------|-----------------|-----------------|
+| NHKV  | 1e-8 | 1e-7 |
+| GMOD1 | 1e-9 | 1e-9 |
+| GMOD2 | 1e-9 | 1e-9 |
+
+These are set automatically when switching models. Using looser tolerances (e.g., atol = 1e-6) produces physically incorrect results (spurious underdamped oscillations). Fitting uses the same tolerances as the display simulation — always verify the tolerance settings before fitting.
+
+---
+
 ## Project structure
 
 ```
@@ -94,7 +126,7 @@ imr_gui/
 │   ├── gmod_solver.py      # GMOD1 / GMOD2 solvers (Keller-Miksis + BDF)
 │   └── __init__.py
 ├── opt/
-│   └── nhkv_fit.py         # Curve-fitting worker
+│   └── nhkv_fit.py         # Fitting engine (all algorithms)
 ├── io/
 │   └── mat_loader.py       # Experimental data loader
 └── ui/
@@ -110,3 +142,4 @@ test/                       # Test MAT files
 - All internal units are SI (seconds, meters, Pascals). Display units are cosmetic only.
 - Solvers use `scipy.solve_ivp` with the BDF method and sparse Jacobian (SuperLU) for stiff bubble dynamics.
 - GMOD1 and GMOD2 are independent constitutive models with separate parameter sets, solvers, and JSON descriptors.
+- Parallel fitting uses `multiprocessing` (not threads) to bypass the Python GIL. On Windows, the entry point `python -m imr_gui` includes the required `freeze_support()` guard.

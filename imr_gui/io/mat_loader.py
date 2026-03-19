@@ -114,6 +114,50 @@ def _get_scalar_from(namespace: dict, candidates: list[str]) -> float | None:
     return None
 
 
+def _find_rmax_time(t: NDArray[np.float64],
+                    R: NDArray[np.float64],
+                    n_pts: int = 7) -> float:
+    """Return the sub-sample peak time by fitting a parabola to the *n_pts*
+    points nearest to max(R), then solving for the vertex analytically.
+
+    Mirrors MATLAB's ``Rmax_fit`` (which uses 4 points and index space);
+    here we use *n_pts* points and operate directly in time space.
+
+    Falls back to the raw argmax time if the fit is ill-conditioned
+    (e.g. parabola opens upward, or fitted peak lies outside the window).
+    """
+    if R.size < 3:
+        return float(t[np.argmax(R)])
+
+    i_max = int(np.argmax(R))
+    half  = n_pts // 2
+    i_lo  = max(0, i_max - half)
+    i_hi  = min(R.size - 1, i_max + half)
+
+    # need at least 3 points for a degree-2 fit
+    if (i_hi - i_lo + 1) < 3:
+        return float(t[i_max])
+
+    t_win = t[i_lo : i_hi + 1]
+    R_win = R[i_lo : i_hi + 1]
+
+    # polyfit returns [a, b, c] for  R = a*t^2 + b*t + c
+    p = np.polyfit(t_win, R_win, 2)
+    a, b = p[0], p[1]
+
+    # parabola must open downward (a < 0) to have a maximum
+    if a >= 0:
+        return float(t[i_max])
+
+    t_peak = -b / (2.0 * a)
+
+    # sanity check: vertex must lie within the fitting window
+    if not (t_win[0] <= t_peak <= t_win[-1]):
+        return float(t[i_max])
+
+    return float(t_peak)
+
+
 def load_experiment_mat(path: str) -> ExperimentData:
     """Load experimental data from a ``.mat`` file.
 
@@ -145,6 +189,11 @@ def load_experiment_mat(path: str) -> ExperimentData:
     order = np.argsort(t)
     t = t[order]
     R = R[order]
+
+    # Shift time so that the interpolated R-peak sits at t = 0,
+    # matching MATLAB's fun_read_data / Rmax_fit convention.
+    t_peak = _find_rmax_time(t, R, n_pts=7)
+    t = t - t_peak
 
     P_inf = _get_scalar_from(ns, ["Pinf", "P_inf", "pinf"])
     rho   = _get_scalar_from(ns, ["rho", "density"])

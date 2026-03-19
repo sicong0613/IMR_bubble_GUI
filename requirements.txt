@@ -3,3 +3,6 @@ scipy>=1.11
 matplotlib>=3.8
 PySide6>=6.6
 mat73>=0.65
+
+# Optional: CMA-ES algorithm (pip install cma)
+# cma>=3.3

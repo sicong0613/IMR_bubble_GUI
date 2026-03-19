@@ -8,7 +8,12 @@
       "Bash(python -c \"from imr_gui.app import MainWindow; print\\(''Import OK''\\)\")",
       "Bash(py -3.11 -c \"import h5py; print\\(''h5py:'', h5py.__version__\\)\")",
       "Bash(py -3.11 -c \"import mat73; print\\(''mat73:'', mat73.__version__\\)\")",
-      "Bash(py -3.11 -m pip show PySide6 scipy numpy mat73)"
+      "Bash(py -3.11 -m pip show PySide6 scipy numpy mat73)",
+      "Bash(py -3.11 -c \"import cma; print\\(cma.__version__\\)\")",
+      "Bash(py -3.11 -m pip install cma)",
+      "Bash(py -3.11 -c \"from imr_gui.opt import OptConfig, AVAILABLE_METHODS, DE_STRATEGIES, _HAS_CMA; c = OptConfig\\(\\); print\\(''methods:'', AVAILABLE_METHODS\\); print\\(''CMA-ES available:'', _HAS_CMA\\); print\\(''default:'', c.method, c.max_fev\\)\")",
+      "Bash(py -3.11 -c \":*)",
+      "Bash(pip show:*)"
     ]
   }
 }
