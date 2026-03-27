@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import functools
+import json
 import traceback
 from dataclasses import dataclass
 import time
 import math
 import re
+from pathlib import Path
 
 import numpy as np
 from scipy.io import loadmat, savemat
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -69,6 +72,14 @@ from imr_gui.opt import (
 class _NoWheelSpinBox(QDoubleSpinBox):
     """QDoubleSpinBox that ignores mouse-wheel events so that scrolling
     the parent QScrollArea works instead of changing the value."""
+
+    def wheelEvent(self, event):  # noqa: N802
+        event.ignore()
+
+
+class _NoWheelComboBox(QComboBox):
+    """QComboBox that ignores mouse-wheel events (prevents accidental
+    value changes while scrolling the parent panel)."""
 
     def wheelEvent(self, event):  # noqa: N802
         event.ignore()
@@ -323,6 +334,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+        self._load_settings()
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
         self._set_mode("simulation")
@@ -383,7 +395,7 @@ class MainWindow(QMainWindow):
         # ---- Model selector row ----
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("Model:"))
-        self._cmb_model = QComboBox()
+        self._cmb_model = _NoWheelComboBox()
         for key in AVAILABLE_MODELS:
             self._cmb_model.addItem(key)
         self._cmb_model.setCurrentText("NHKV")
@@ -560,6 +572,13 @@ class MainWindow(QMainWindow):
         self.spin_rho.setValue(998.0)
         self.spin_rho.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
 
+        self.spin_c_long = _NoWheelSpinBox()
+        self.spin_c_long.setRange(1.0, 1e5)
+        self.spin_c_long.setDecimals(1)
+        self.spin_c_long.setValue(1485.0)
+        self.spin_c_long.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_c_long.setToolTip("Longitudinal speed of sound in liquid (m/s)")
+
         self.spin_NT = _NoWheelSpinBox()
         self.spin_NT.setRange(50, 2000)
         self.spin_NT.setDecimals(0)
@@ -567,7 +586,7 @@ class MainWindow(QMainWindow):
         self.spin_NT.setValue(500)
         self.spin_NT.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
 
-        self._cmb_solver = QComboBox()
+        self._cmb_solver = _NoWheelComboBox()
         self._cmb_solver.addItems(["BDF", "Radau", "LSODA"])
         self._cmb_solver.setCurrentText("BDF")
         self._cmb_solver.setToolTip(
@@ -605,6 +624,7 @@ class MainWindow(QMainWindow):
             form = QFormLayout()
             form.addRow("P_inf (Pa):", self.spin_P_inf)
             form.addRow("rho (kg/m³):", self.spin_rho)
+            form.addRow("c_long (m/s):", self.spin_c_long)
             form.addRow("NT (grid):", self.spin_NT)
             lay.addLayout(form)
 
@@ -629,7 +649,7 @@ class MainWindow(QMainWindow):
             self._adv_toggle.toggled.connect(self._toggle_advanced_solver)
 
             btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-            btn_box.rejected.connect(dlg.accept)
+            btn_box.rejected.connect(lambda: (self._save_settings(), dlg.accept()))
             lay.addWidget(btn_box)
 
             self._physics_dlg = dlg
@@ -657,7 +677,7 @@ class MainWindow(QMainWindow):
     def _build_optimizer_settings_dlg(self):
         from PySide6.QtWidgets import (
             QDialog, QVBoxLayout, QFormLayout,
-            QComboBox, QSpinBox, QCheckBox,
+            QSpinBox, QCheckBox,
             QGroupBox, QStackedWidget, QLabel, QDialogButtonBox,
             QWidget,
         )
@@ -669,7 +689,7 @@ class MainWindow(QMainWindow):
 
         # ── Algorithm ──────────────────────────────────────────────────
         form_top = QFormLayout()
-        self._cmb_opt_method = QComboBox()
+        self._cmb_opt_method = _NoWheelComboBox()
         methods = [m for m in AVAILABLE_METHODS
                    if m != "CMA-ES" or _HAS_CMA]
         self._cmb_opt_method.addItems(methods)
@@ -771,7 +791,7 @@ class MainWindow(QMainWindow):
         # page 3 – Differential Evolution
         pg_de = QWidget()
         fde = QFormLayout(pg_de)
-        self._cmb_de_strategy = QComboBox()
+        self._cmb_de_strategy = _NoWheelComboBox()
         self._cmb_de_strategy.addItems(DE_STRATEGIES)
         fde.addRow("Strategy:", self._cmb_de_strategy)
         self._spin_de_maxiter = QSpinBox()
@@ -876,7 +896,7 @@ class MainWindow(QMainWindow):
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel
         )
-        btn_box.accepted.connect(lambda: (self._opt_dlg_save(), dlg.accept()))
+        btn_box.accepted.connect(lambda: (self._opt_dlg_save(), self._save_settings(), dlg.accept()))
         btn_box.rejected.connect(dlg.reject)
         root.addWidget(btn_box)
 
@@ -943,6 +963,101 @@ class MainWindow(QMainWindow):
         c.bh_stepsize = self._spin_bh_step.value()
 
     # =====================================================================
+    # settings persistence (JSON)
+    # =====================================================================
+
+    def _settings_path(self) -> Path:
+        return Path(__file__).parent / "settings.json"
+
+    def _save_settings(self):
+        c = self._opt_config
+        data = {
+            "physics": {
+                "P_inf":   float(self.spin_P_inf.value()),
+                "rho":     float(self.spin_rho.value()),
+                "c_long":  float(self.spin_c_long.value()),
+                "NT":      int(self.spin_NT.value()),
+                "solver":  self._cmb_solver.currentText(),
+                "rtol":    self.le_rtol.text(),
+                "atol":    self.le_atol.text(),
+            },
+            "optimizer": {
+                "method":             c.method,
+                "n_workers":          c.n_workers,
+                "max_fev":            c.max_fev,
+                "x_tol":              c.x_tol,
+                "f_tol":              c.f_tol,
+                "nm_adaptive":        c.nm_adaptive,
+                "de_strategy":        c.de_strategy,
+                "de_maxiter":         c.de_maxiter,
+                "de_popsize":         c.de_popsize,
+                "de_mutation":        c.de_mutation,
+                "de_recombination":   c.de_recombination,
+                "cma_sigma0":         c.cma_sigma0,
+                "cma_maxfev":         c.cma_maxfev,
+                "da_maxfev":          c.da_maxfev,
+                "da_initial_temp":    c.da_initial_temp,
+                "da_restart_temp":    c.da_restart_temp,
+                "bh_n_iter":          c.bh_n_iter,
+                "bh_stepsize":        c.bh_stepsize,
+                "ps_complete_poll":   c.ps_complete_poll,
+                "ps_mesh_contraction": c.ps_mesh_contraction,
+                "ps_mesh_expansion":  c.ps_mesh_expansion,
+                "ps_initial_mesh":    c.ps_initial_mesh,
+                "ps_search_pts":      c.ps_search_pts,
+            },
+        }
+        try:
+            self._settings_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_settings(self):
+        try:
+            text = self._settings_path().read_text(encoding="utf-8")
+            data = json.loads(text)
+        except Exception:
+            return
+
+        phys = data.get("physics", {})
+        if "P_inf"  in phys: self.spin_P_inf.setValue(float(phys["P_inf"]))
+        if "rho"    in phys: self.spin_rho.setValue(float(phys["rho"]))
+        if "c_long" in phys: self.spin_c_long.setValue(float(phys["c_long"]))
+        if "NT"     in phys: self.spin_NT.setValue(int(phys["NT"]))
+        if "solver" in phys:
+            idx = self._cmb_solver.findText(phys["solver"])
+            if idx >= 0:
+                self._cmb_solver.setCurrentIndex(idx)
+        if "rtol" in phys: self.le_rtol.setText(phys["rtol"])
+        if "atol" in phys: self.le_atol.setText(phys["atol"])
+
+        opt = data.get("optimizer", {})
+        c = self._opt_config
+        if "method"             in opt: c.method             = opt["method"]
+        if "n_workers"          in opt: c.n_workers          = int(opt["n_workers"])
+        if "max_fev"            in opt: c.max_fev            = int(opt["max_fev"])
+        if "x_tol"              in opt: c.x_tol              = float(opt["x_tol"])
+        if "f_tol"              in opt: c.f_tol              = float(opt["f_tol"])
+        if "nm_adaptive"        in opt: c.nm_adaptive        = bool(opt["nm_adaptive"])
+        if "de_strategy"        in opt: c.de_strategy        = opt["de_strategy"]
+        if "de_maxiter"         in opt: c.de_maxiter         = int(opt["de_maxiter"])
+        if "de_popsize"         in opt: c.de_popsize         = int(opt["de_popsize"])
+        if "de_mutation"        in opt: c.de_mutation        = float(opt["de_mutation"])
+        if "de_recombination"   in opt: c.de_recombination   = float(opt["de_recombination"])
+        if "cma_sigma0"         in opt: c.cma_sigma0         = float(opt["cma_sigma0"])
+        if "cma_maxfev"         in opt: c.cma_maxfev         = int(opt["cma_maxfev"])
+        if "da_maxfev"          in opt: c.da_maxfev          = int(opt["da_maxfev"])
+        if "da_initial_temp"    in opt: c.da_initial_temp    = float(opt["da_initial_temp"])
+        if "da_restart_temp"    in opt: c.da_restart_temp    = float(opt["da_restart_temp"])
+        if "bh_n_iter"          in opt: c.bh_n_iter          = int(opt["bh_n_iter"])
+        if "bh_stepsize"        in opt: c.bh_stepsize        = float(opt["bh_stepsize"])
+        if "ps_complete_poll"   in opt: c.ps_complete_poll   = bool(opt["ps_complete_poll"])
+        if "ps_mesh_contraction" in opt: c.ps_mesh_contraction = float(opt["ps_mesh_contraction"])
+        if "ps_mesh_expansion"  in opt: c.ps_mesh_expansion  = float(opt["ps_mesh_expansion"])
+        if "ps_initial_mesh"    in opt: c.ps_initial_mesh    = float(opt["ps_initial_mesh"])
+        if "ps_search_pts"      in opt: c.ps_search_pts      = int(opt["ps_search_pts"])
+
+    # =====================================================================
     # dynamic parameter panel
     # =====================================================================
 
@@ -976,8 +1091,13 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(content)
         lay.setContentsMargins(2, 2, 2, 2)
 
-        for p in model.parameters:
+        for i, p in enumerate(model.parameters):
             self._add_param_row(p, lay)
+            if i < len(model.parameters) - 1:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setFrameShadow(QFrame.Shadow.Sunken)
+                lay.addWidget(sep)
 
         lay.addStretch(1)
         self._param_scroll.setWidget(content)
@@ -1011,7 +1131,7 @@ class MainWindow(QMainWindow):
         unit_combo: QComboBox | None = None
         unit_options = list(p.units) if p.units else []
         if len(unit_options) > 1:
-            unit_combo = QComboBox()
+            unit_combo = _NoWheelComboBox()
             for u in unit_options:
                 unit_combo.addItem(u.label)
             unit_combo.setFixedWidth(_W_UNIT)
@@ -1024,7 +1144,7 @@ class MainWindow(QMainWindow):
             lbl_unit.setFixedWidth(_W_UNIT)
             row.addWidget(lbl_unit)
 
-        cmb_scale = QComboBox()
+        cmb_scale = _NoWheelComboBox()
         cmb_scale.addItems(["lin", "log"])
         if p.scale == "log":
             cmb_scale.setCurrentIndex(1)
@@ -1181,6 +1301,7 @@ class MainWindow(QMainWindow):
         """Build solver inputs from GUI params + constants for the current model."""
         key = self._get_active_model_key()
         const = dict(self._model_constants)
+        const["c_long"] = float(self.spin_c_long.value())
         Req = float(self.spin_Req_um.value()) * 1e-6
         tspan = float(self.spin_tspan_us.value()) * 1e-6
         NT = int(self.spin_NT.value())
@@ -1241,6 +1362,7 @@ class MainWindow(QMainWindow):
         """Called by the fitting engine to run one simulation."""
         key = self._get_active_model_key()
         const = dict(self._model_constants)
+        const["c_long"] = float(self.spin_c_long.value())
         Req = float(self.spin_Req_um.value()) * 1e-6
         NT = int(self.spin_NT.value())
         solver = self._get_solver_settings()
@@ -1628,13 +1750,13 @@ class MainWindow(QMainWindow):
 
             used_pinf = float(self.spin_P_inf.value())
             used_rho = float(self.spin_rho.value())
-            _dam_str = f"  |  N_dam={out.n_damaged}" if out.n_damaged > 0 else ""
+            _hdr = f"Simulation ({model_key}):"
+            _ind = " " * len(_hdr)
             self.lbl_output.setPlainText(
-                f"Simulation ({model_key}):  Rmax={out.Rmax_sim*1e6:.3f} µm  |  "
-                f"tc={out.tc*1e6:.3f} µs  |  Uc={out.Uc:.3f} m/s  |  "
-                f"pts={out.t_sim.shape[0]}{_dam_str}\n"
-                f"  P_inf={used_pinf:.1f} Pa  |  rho={used_rho:.1f} kg/m³  |  "
-                f"Req={float(self.spin_Req_um.value()):.3f} µm  |  NT={int(self.spin_NT.value())}"
+                f"{_hdr}\tRmax={out.Rmax_sim*1e6:.3f} µm\t|\t"
+                f"tc={out.tc*1e6:.3f} µs\t\t|\tUc={out.Uc:.3f} m/s\n"
+                f"{_ind}\tP_inf={used_pinf:.1f} Pa\t|\t"
+                f"rho={used_rho:.1f} kg/m³\t|\tReq={float(self.spin_Req_um.value()):.3f} µm"
             )
             self.statusBar().showMessage("Simulation completed")
 
@@ -1759,13 +1881,12 @@ class MainWindow(QMainWindow):
         model_key = self._get_active_model_key()
         dlg = QProgressDialog(f"Fitting {model_key} to experiment...", "Stop", 0, 0, self)
         dlg.setWindowTitle("Fitting in progress")
-        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setWindowModality(Qt.NonModal)
         dlg.setMinimumDuration(0)
         dlg.setRange(0, 0)
         dlg.show()
         self._fit_dialog = dlg
 
-        QApplication.setOverrideCursor(Qt.WaitCursor)
         self._fit_start_time = time.time()
         self._fit_timer.start()
         self.btn_fit.setEnabled(False)
@@ -1815,15 +1936,15 @@ class MainWindow(QMainWindow):
 
         elapsed = ""
         if self._fit_start_time is not None:
-            elapsed = f"  |  elapsed {self._sec_to_hms(time.time() - self._fit_start_time)}"
+            elapsed = f"\t|\telapsed {self._sec_to_hms(time.time() - self._fit_start_time)}"
         step_info = ""
         if prog.step_size is not None:
-            step_info = f"  |  step={prog.step_size:.3e}"
+            step_info = f"\t|\tstep={prog.step_size:.3e}"
         status_info = ""
         if prog.status:
             status_info = f"  [{prog.status}]"
         self.lbl_output.appendPlainText(
-            f"nfev={prog.nfev}  |  LSQErr={prog.best_err:.4e}"
+            f"nfev={prog.nfev}\t|\tLSQErr={prog.best_err:.4e}"
             f"{step_info}{status_info}{elapsed}"
         )
 
@@ -1839,7 +1960,6 @@ class MainWindow(QMainWindow):
             )
 
     def _on_fit_ok(self, res: FitResult):
-        QApplication.restoreOverrideCursor()
         self._fit_timer.stop()
         elapsed = None
         if self._fit_start_time is not None:
@@ -1882,12 +2002,11 @@ class MainWindow(QMainWindow):
         label = "Fit stopped" if was_stopped else "Fit completed"
         extra = f", elapsed {self._sec_to_hms(elapsed)}" if elapsed else ""
         self.lbl_output.appendPlainText(
-            f"--- {label}{extra}  |  nfev={res.nfev}  |  LSQErr={res.lsq_err:.4e}"
+            f"--- {label}{extra}\t|\tnfev={res.nfev}\t|\tLSQErr={res.lsq_err:.4e}"
         )
         self.statusBar().showMessage(label)
 
     def _on_fit_fail(self, msg: str, tb: str):
-        QApplication.restoreOverrideCursor()
         self._fit_timer.stop()
         if self._fit_start_time is not None:
             self._fit_start_time = None
