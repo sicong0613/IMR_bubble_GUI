@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 )
 
 from imr_gui.imr import NhkvInputs, NhkvOutputs, simulate_nhkv_lic
+from imr_gui.imr import NhkvRmaxInputs, simulate_nhkv_rmax_lic
 from imr_gui.imr import GMODInputs, simulate_gmod_lic
 from imr_gui.imr import GMOD1Inputs, simulate_gmod1_lic
 from imr_gui.io import load_experiment_mat, find_rmax_value
@@ -192,18 +193,30 @@ class _SimSpec:
     rho: float
     const: dict
     solver: dict
+    Rmax_exp: float = 0.0  # used only by NHKV (Rmax); 0 means fall back to Req
+    bubble_model: str = "Keller-Miksis"
 
 
 def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
     """Module-level dispatch function — picklable for ProcessPoolExecutor workers."""
     key = spec.model_key
+    bm = spec.bubble_model
     if key == "NHKV":
         const_kw = {k: v for k, v in spec.const.items()
                     if k in NhkvInputs.__dataclass_fields__}
         return simulate_nhkv_lic(NhkvInputs(
             U0=params_si["U0"], G=params_si["G"], mu=params_si["mu"],
             Req=spec.Req, tspan=tspan, NT=spec.NT,
-            P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
+            P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
+        ))
+    elif key == "NHKV (Rmax)":
+        Rmax_exp = spec.Rmax_exp if spec.Rmax_exp > 0 else spec.Req
+        const_kw = {k: v for k, v in spec.const.items()
+                    if k in NhkvRmaxInputs.__dataclass_fields__}
+        return simulate_nhkv_rmax_lic(NhkvRmaxInputs(
+            G=params_si["G"], mu=params_si["mu"],
+            Req=spec.Req, Rmax_exp=Rmax_exp, tspan=tspan, NT=spec.NT,
+            P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
     elif key == "GMOD1":
         const_kw = {k: v for k, v in spec.const.items()
@@ -217,7 +230,7 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             mu=params_si.get("mu", 0.226),
             lambda_Y=params_si.get("lambda_Y", 1.5),
             Req=spec.Req, tspan=tspan, NT=spec.NT,
-            P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
+            P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
     else:  # GMOD2
         const_kw = {k: v for k, v in spec.const.items()
@@ -235,7 +248,7 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             mu=params_si.get("mu", 0.226),
             lambda_Y=params_si.get("lambda_Y", 1.5),
             Req=spec.Req, tspan=tspan, NT=spec.NT,
-            P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
+            P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
 
 
@@ -370,7 +383,18 @@ class MainWindow(QMainWindow):
         self._act_fit_mode.triggered.connect(lambda: self._set_mode("fitting"))
 
         physics_menu = self.menuBar().addMenu("Physics")
-        physics_menu.addAction("Bubble dynamics: Keller-Miksis (fixed)").setEnabled(False)
+        bubble_menu = physics_menu.addMenu("Bubble dynamics")
+        ag_bubble = QActionGroup(self)
+        ag_bubble.setExclusive(True)
+        self._act_km = bubble_menu.addAction("Keller-Miksis")
+        self._act_rp = bubble_menu.addAction("Rayleigh-Plesset")
+        for act in (self._act_km, self._act_rp):
+            act.setCheckable(True)
+            ag_bubble.addAction(act)
+        self._act_km.setChecked(True)
+        self._bubble_model = "Keller-Miksis"
+        self._act_km.triggered.connect(lambda: setattr(self, "_bubble_model", "Keller-Miksis"))
+        self._act_rp.triggered.connect(lambda: setattr(self, "_bubble_model", "Rayleigh-Plesset"))
         act_phys_settings = physics_menu.addAction("Physics Settings...")
         act_phys_settings.triggered.connect(self._show_physics_settings)
 
@@ -973,6 +997,7 @@ class MainWindow(QMainWindow):
         c = self._opt_config
         data = {
             "physics": {
+                "bubble_model": self._bubble_model,
                 "P_inf":   float(self.spin_P_inf.value()),
                 "rho":     float(self.spin_rho.value()),
                 "c_long":  float(self.spin_c_long.value()),
@@ -1020,6 +1045,11 @@ class MainWindow(QMainWindow):
             return
 
         phys = data.get("physics", {})
+        if "bubble_model" in phys:
+            bm = phys["bubble_model"]
+            self._bubble_model = bm
+            self._act_rp.setChecked(bm == "Rayleigh-Plesset")
+            self._act_km.setChecked(bm != "Rayleigh-Plesset")
         if "P_inf"  in phys: self.spin_P_inf.setValue(float(phys["P_inf"]))
         if "rho"    in phys: self.spin_rho.setValue(float(phys["rho"]))
         if "c_long" in phys: self.spin_c_long.setValue(float(phys["c_long"]))
@@ -1309,13 +1339,27 @@ class MainWindow(QMainWindow):
         P_inf = float(self.spin_P_inf.value())
         rho = float(self.spin_rho.value())
 
+        bm = self._bubble_model
         if key == "NHKV":
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvInputs.__dataclass_fields__}
             return NhkvInputs(
                 U0=params["U0"], G=params["G"], mu=params["mu"],
                 Req=Req, tspan=tspan, NT=NT,
-                P_inf=P_inf, rho=rho, **solver, **const_kw,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
+            )
+        elif key == "NHKV (Rmax)":
+            Rmax_exp = (
+                find_rmax_value(self.state.exp_t, self.state.exp_R)
+                if self.state.exp_t is not None and self.state.exp_R is not None
+                else Req
+            )
+            const_kw = {k: v for k, v in const.items()
+                        if k in NhkvRmaxInputs.__dataclass_fields__}
+            return NhkvRmaxInputs(
+                G=params["G"], mu=params["mu"],
+                Req=Req, Rmax_exp=Rmax_exp, tspan=tspan, NT=NT,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
             )
         elif key == "GMOD1":
             const_kw = {k: v for k, v in const.items()
@@ -1329,7 +1373,7 @@ class MainWindow(QMainWindow):
                 mu=params.get("mu", 0.226),
                 lambda_Y=params.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
-                P_inf=P_inf, rho=rho, **solver, **const_kw,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
             )
         else:  # GMOD2
             const_kw = {k: v for k, v in const.items()
@@ -1347,13 +1391,15 @@ class MainWindow(QMainWindow):
                 mu=params.get("mu", 0.226),
                 lambda_Y=params.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
-                P_inf=P_inf, rho=rho, **solver, **const_kw,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
             )
 
     def _get_simulate_fn(self):
         key = self._get_active_model_key()
         if key == "NHKV":
             return simulate_nhkv_lic
+        if key == "NHKV (Rmax)":
+            return simulate_nhkv_rmax_lic
         if key == "GMOD1":
             return simulate_gmod1_lic
         return simulate_gmod_lic  # GMOD2
@@ -1369,15 +1415,30 @@ class MainWindow(QMainWindow):
         P_inf = float(self.spin_P_inf.value())
         rho = float(self.spin_rho.value())
 
+        bm = self._bubble_model
         if key == "NHKV":
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvInputs.__dataclass_fields__}
             inp = NhkvInputs(
                 U0=params_si["U0"], G=params_si["G"], mu=params_si["mu"],
                 Req=Req, tspan=tspan, NT=NT,
-                P_inf=P_inf, rho=rho, **solver, **const_kw,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
             )
             return simulate_nhkv_lic(inp)
+        elif key == "NHKV (Rmax)":
+            Rmax_exp = (
+                find_rmax_value(self.state.exp_t, self.state.exp_R)
+                if self.state.exp_t is not None and self.state.exp_R is not None
+                else Req
+            )
+            const_kw = {k: v for k, v in const.items()
+                        if k in NhkvRmaxInputs.__dataclass_fields__}
+            inp = NhkvRmaxInputs(
+                G=params_si["G"], mu=params_si["mu"],
+                Req=Req, Rmax_exp=Rmax_exp, tspan=tspan, NT=NT,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
+            )
+            return simulate_nhkv_rmax_lic(inp)
         elif key == "GMOD1":
             const_kw = {k: v for k, v in const.items()
                         if k in GMOD1Inputs.__dataclass_fields__}
@@ -1390,7 +1451,7 @@ class MainWindow(QMainWindow):
                 mu=params_si.get("mu", 0.226),
                 lambda_Y=params_si.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
-                P_inf=P_inf, rho=rho, **solver, **const_kw,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
             )
             return simulate_gmod1_lic(inp)
         else:  # GMOD2
@@ -1409,7 +1470,7 @@ class MainWindow(QMainWindow):
                 mu=params_si.get("mu", 0.226),
                 lambda_Y=params_si.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
-                P_inf=P_inf, rho=rho, **solver, **const_kw,
+                P_inf=P_inf, rho=rho, bubble_model=bm, **solver, **const_kw,
             )
             return simulate_gmod_lic(inp)
 
@@ -1750,13 +1811,18 @@ class MainWindow(QMainWindow):
 
             used_pinf = float(self.spin_P_inf.value())
             used_rho = float(self.spin_rho.value())
+            _C = 22  # fixed column width for each data field
             _hdr = f"Simulation ({model_key}):"
             _ind = " " * len(_hdr)
+            _r = f"Rmax={out.Rmax_sim*1e6:.3f} µm"
+            _t = f"tc={out.tc*1e6:.3f} µs"
+            _u = f"Uc={out.Uc:.3f} m/s"
+            _p = f"P_inf={used_pinf:.1f} Pa"
+            _rh = f"rho={used_rho:.1f} kg/m³"
+            _rq = f"Req={float(self.spin_Req_um.value()):.3f} µm"
             self.lbl_output.setPlainText(
-                f"{_hdr}\tRmax={out.Rmax_sim*1e6:.3f} µm\t|\t"
-                f"tc={out.tc*1e6:.3f} µs\t\t|\tUc={out.Uc:.3f} m/s\n"
-                f"{_ind}\tP_inf={used_pinf:.1f} Pa\t|\t"
-                f"rho={used_rho:.1f} kg/m³\t|\tReq={float(self.spin_Req_um.value()):.3f} µm"
+                f"{_hdr}  {_r:<{_C}}| {_t:<{_C}}| {_u}\n"
+                f"{_ind}  {_p:<{_C}}| {_rh:<{_C}}| {_rq}"
             )
             self.statusBar().showMessage("Simulation completed")
 
@@ -1847,6 +1913,11 @@ class MainWindow(QMainWindow):
             )
             return
 
+        _rmax_exp = (
+            find_rmax_value(self.state.exp_t, self.state.exp_R)
+            if self.state.exp_t is not None and self.state.exp_R is not None
+            else 0.0
+        )
         sim_spec = _SimSpec(
             model_key=self._get_active_model_key(),
             Req=float(self.spin_Req_um.value()) * 1e-6,
@@ -1855,6 +1926,8 @@ class MainWindow(QMainWindow):
             rho=float(self.spin_rho.value()),
             const=dict(self._model_constants),
             solver=self._get_solver_settings(),
+            Rmax_exp=_rmax_exp,
+            bubble_model=self._bubble_model,
         )
         cfg = FitConfig(
             t_exp=t_windowed,
@@ -2202,9 +2275,11 @@ class MainWindow(QMainWindow):
                 # Known struct layouts ordered by parameter position (from JSON).
                 # Used when MATLAB 'string' type blocks name decoding.
                 _LAYOUTS: dict[int, list[str]] = {
+                    2:  ["G", "mu"],                                        # NHKV (Rmax)
+                    3:  ["U0", "G", "mu"],                                  # NHKV
+                    7:  ["U0", "GA", "alpha", "GB", "beta", "mu", "lambda_Y"],
                     11: ["U0", "GA1", "GA2", "alpha1", "alpha2",
                          "GB1", "GB2", "beta1", "beta2", "mu", "lambda_Y"],
-                    7:  ["U0", "GA", "alpha", "GB", "beta", "mu", "lambda_Y"],
                 }
 
                 m = loadmat(path, squeeze_me=True, struct_as_record=False)

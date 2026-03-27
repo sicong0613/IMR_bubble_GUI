@@ -1,0 +1,36 @@
+{
+  "physics": {
+    "P_inf": 101325.0,
+    "rho": 998.0,
+    "c_long": 1485.0,
+    "NT": 500,
+    "solver": "BDF",
+    "rtol": "1e-8",
+    "atol": "1e-7"
+  },
+  "optimizer": {
+    "method": "Nelder-Mead",
+    "n_workers": 1,
+    "max_fev": 500,
+    "x_tol": 0.0001,
+    "f_tol": 0.1,
+    "nm_adaptive": true,
+    "de_strategy": "best1bin",
+    "de_maxiter": 30,
+    "de_popsize": 5,
+    "de_mutation": 0.7,
+    "de_recombination": 0.7,
+    "cma_sigma0": 0.3,
+    "cma_maxfev": 1000,
+    "da_maxfev": 1000,
+    "da_initial_temp": 5230.0,
+    "da_restart_temp": 2e-05,
+    "bh_n_iter": 50,
+    "bh_stepsize": 0.5,
+    "ps_complete_poll": false,
+    "ps_mesh_contraction": 0.5,
+    "ps_mesh_expansion": 2.0,
+    "ps_initial_mesh": 1.0,
+    "ps_search_pts": 0
+  }
+}

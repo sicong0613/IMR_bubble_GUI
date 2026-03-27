@@ -82,6 +82,10 @@ def load_nhkv_model() -> ConstitutiveModel:
     return _load_model_json("nhkv.json")
 
 
+def load_nhkv_rmax_model() -> ConstitutiveModel:
+    return _load_model_json("nhkv_rmax.json")
+
+
 def load_gmod1_model() -> ConstitutiveModel:
     return _load_model_json("gmod1.json")
 
@@ -92,6 +96,7 @@ def load_gmod2_model() -> ConstitutiveModel:
 
 AVAILABLE_MODELS = {
     "NHKV": load_nhkv_model,
+    "NHKV (Rmax)": load_nhkv_rmax_model,
     "GMOD1": load_gmod1_model,
     "GMOD2": load_gmod2_model,
 }
@@ -99,6 +104,7 @@ AVAILABLE_MODELS = {
 
 __all__ = [
     "UnitOption", "ConstitutiveParameter", "ConstitutiveModel",
-    "load_nhkv_model", "load_gmod1_model", "load_gmod2_model", "AVAILABLE_MODELS",
+    "load_nhkv_model", "load_nhkv_rmax_model",
+    "load_gmod1_model", "load_gmod2_model", "AVAILABLE_MODELS",
 ]
 

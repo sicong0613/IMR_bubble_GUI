@@ -45,6 +45,7 @@ class GMODInputs:
     rel_tol: float = 1e-8   # BDF needs ~10× tighter rtol than MATLAB ode23tb
     abs_tol: float = 1e-7   # to resolve lambda_nv (Maxwell branch) dynamics
     solver_method: str = "BDF"  # BDF ≈ MATLAB ode15s; faster than Radau for this problem
+    bubble_model: str = "Keller-Miksis"  # "Keller-Miksis" or "Rayleigh-Plesset"
 
     # --- far-field ---
     P_inf: float = 101325.0
@@ -197,6 +198,7 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
     A_star = A * inp.T_inf / K_inf
     B_star = B / K_inf
     Pv_star = Pv / inp.P_inf
+    _use_rp = (inp.bubble_model == "Rayleigh-Plesset")
 
     _EPS_ALPHA = 1e-12
     alpha1 = max(float(inp.alpha1), _EPS_ALPHA)
@@ -247,7 +249,7 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
     use_CaB2 = CaB2 < 1e10
 
     # ------------------------------------------------------------------
-    def rhs(t_star: float, x: NDArray[np.float64]) -> NDArray[np.float64]:
+    def rhs(t_star: float, x: NDArray[np.float64], _urp: bool = _use_rp) -> NDArray[np.float64]:
         R = x[0]
         U = x[1]
         P = x[2]
@@ -413,13 +415,16 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         f_dot = 2.0 * (dSintA_dt + dSintB_dt) / term_r - Sint_integrand * x_dot / term_r
         Sdot  = float(np.trapz(f_dot, term_r) + np.trapz(Sint_integrand, x_dot))
 
-        # ======= Keller-Miksis (no explicit viscous term) =======
         rdot = U
-        udot = (
-            (1 + U / C_star) * (P - 1.0 / (We * R) + S - 1)
-            + R / C_star * (pdot + U / (We * R ** 2) + Sdot)
-            - 1.5 * (1 - U / (3 * C_star)) * U ** 2
-        ) / ((1 - U / C_star) * R)
+        _fm = P - 1.0 / (We * R) + S - 1.0
+        if _urp:
+            udot = (_fm - 1.5 * U ** 2) / R
+        else:
+            udot = (
+                (1 + U / C_star) * _fm
+                + R / C_star * (pdot + U / (We * R ** 2) + Sdot)
+                - 1.5 * (1 - U / (3 * C_star)) * U ** 2
+            ) / ((1 - U / C_star) * R)
 
         out = np.empty_like(x)
         out[0] = rdot
@@ -603,6 +608,7 @@ class GMOD1Inputs:
     rel_tol: float = 1e-8
     abs_tol: float = 1e-7
     solver_method: str = "BDF"
+    bubble_model: str = "Keller-Miksis"
 
     # --- far-field ---
     P_inf: float = 101325.0
@@ -706,6 +712,7 @@ def _simulate_gmod1_standalone(inp: GMOD1Inputs) -> NhkvOutputs:
     A_star = A * inp.T_inf / K_inf
     B_star = B / K_inf
     Pv_star = Pv / inp.P_inf
+    _use_rp = (inp.bubble_model == "Rayleigh-Plesset")
 
     _EPS_ALPHA = 1e-12
     alpha = max(float(inp.alpha), _EPS_ALPHA)
@@ -750,7 +757,7 @@ def _simulate_gmod1_standalone(inp: GMOD1Inputs) -> NhkvOutputs:
     eps_val = float(np.finfo(float).eps)
 
     # ------------------------------------------------------------------
-    def rhs(t_star: float, x: NDArray[np.float64]) -> NDArray[np.float64]:
+    def rhs(t_star: float, x: NDArray[np.float64], _urp: bool = _use_rp) -> NDArray[np.float64]:
         R     = x[0]
         U     = x[1]
         P     = x[2]
@@ -890,13 +897,16 @@ def _simulate_gmod1_standalone(inp: GMOD1Inputs) -> NhkvOutputs:
         else:
             Sdot = tracker.Sdot_current
 
-        # ======= Keller-Miksis =======
         rdot = U
-        udot = (
-            (1 + U / C_star) * (P - 1.0 / (We * R) + S - 1)
-            + R / C_star * (pdot + U / (We * R ** 2) + Sdot)
-            - 1.5 * (1 - U / (3 * C_star)) * U ** 2
-        ) / ((1 - U / C_star) * R)
+        _fm = P - 1.0 / (We * R) + S - 1.0
+        if _urp:
+            udot = (_fm - 1.5 * U ** 2) / R
+        else:
+            udot = (
+                (1 + U / C_star) * _fm
+                + R / C_star * (pdot + U / (We * R ** 2) + Sdot)
+                - 1.5 * (1 - U / (3 * C_star)) * U ** 2
+            ) / ((1 - U / C_star) * R)
 
         out = np.empty_like(x)
         out[0] = rdot
