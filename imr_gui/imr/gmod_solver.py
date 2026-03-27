@@ -431,31 +431,21 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         return out
 
     # ------------------------------------------------------------------
-    # solve  (two-phase: pre-scan → damage_mask → main integration)
+    # solve  (two-phase: pre-scan → boundary insertion → main integration)
     # ------------------------------------------------------------------
     t_end_star = float(inp.tspan / tc)
-
     method = inp.solver_method
-    jac_sparsity = _build_jac_sparsity_gmod(NT, MT)
-    solver_kw: dict = dict(
-        rtol=inp.rel_tol,
-        atol=inp.abs_tol,
-    )
-    if method in ("BDF", "Radau"):
-        solver_kw["jac_sparsity"] = jac_sparsity
-    if inp.first_step > 0.0:
-        solver_kw["first_step"] = inp.first_step
 
     # --- Phase 1: loose-tolerance pre-scan to find t_rmax and damage mask ---
     def _rmax_event(_, x: NDArray) -> float:
         return float(x[1])  # U = 0 at Rmax (R decreasing → U crosses zero downward)
 
     _rmax_event.terminal = True   # type: ignore[attr-defined]
-    _rmax_event.direction = -1    # type: ignore[attr-defined]  # only detect U: + → -
+    _rmax_event.direction = -1    # type: ignore[attr-defined]
 
     prescan_kw: dict = dict(rtol=1e-6, atol=1e-6)
     if method in ("BDF", "Radau"):
-        prescan_kw["jac_sparsity"] = jac_sparsity
+        prescan_kw["jac_sparsity"] = _build_jac_sparsity_gmod(NT, MT)
     if inp.first_step > 0.0:
         prescan_kw["first_step"] = inp.first_step
 
@@ -468,6 +458,8 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         **prescan_kw,
     )
 
+    lambda_r0_rmax = None
+    lambda_w_rmax = 1.0
     if len(sol_pre.t_events[0]) > 0:
         t_rmax_star = float(sol_pre.t_events[0][0])
         x_rmax = sol_pre.y_events[0][0]
@@ -499,11 +491,52 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         if need_damage:
             tracker.t_rmax_star = t_rmax_star
 
+    # --- Boundary shell insertion ---
+    # Insert one shell at r0_Y (the exact radial position where lambda_r0(Rmax) = lambda_Y)
+    # so the damage front always falls on a grid node.  This makes the stress integral —
+    # and therefore the loss function — a continuous function of lambda_Y, enabling the
+    # optimiser to compute meaningful gradients for this parameter.
+    #
+    # Python closures are late-binding: rebinding r0_star, r0_star3, MT in this scope is
+    # seen by rhs() at call time, so no second closure definition is needed.
+    lambda_nv0_main = lambda_nv0
+    if (lambda_r0_rmax is not None
+            and lambda_Y_val > 1.0
+            and float(lambda_r0_rmax[-1]) < lambda_Y_val < float(lambda_r0_rmax[0])):
+
+        # Analytical inversion of lambda_r0(r0) = lambda_Y
+        r0_Y = ((lambda_w_rmax ** 3 - 1.0) / (lambda_Y_val ** 3 - 1.0)) ** (1.0 / 3.0)
+        idx_ins = int(np.searchsorted(r0_star, r0_Y))
+
+        r0_star = np.insert(r0_star, idx_ins, r0_Y)
+        r0_star3 = r0_star ** 3
+        MT = MT + 1
+
+        lambda_nv0_main = np.insert(lambda_nv0, idx_ins, 1.00001)
+
+        # Recompute damage_mask for the enlarged grid
+        lambda_r0_rmax_new = (
+            1.0 + (1.0 / r0_star3) * (lambda_w_rmax ** 3 - 1.0)
+        ) ** (1.0 / 3.0)
+        tracker.damage_mask = lambda_r0_rmax_new >= lambda_Y_val
+
     # --- Phase 2: main integration (tight tolerance, full duration) ---
+    # Rebuild sparsity for the final MT (200 or 201 depending on boundary insertion).
+    jac_sparsity = _build_jac_sparsity_gmod(NT, MT)
+    solver_kw: dict = dict(rtol=inp.rel_tol, atol=inp.abs_tol)
+    if method in ("BDF", "Radau"):
+        solver_kw["jac_sparsity"] = jac_sparsity
+    if inp.first_step > 0.0:
+        solver_kw["first_step"] = inp.first_step
+
+    x0_main = np.concatenate(
+        ([R0_star, U0_star, P0_star], Theta0, k0, lambda_nv0_main)
+    ).astype(float)
+
     sol = solve_ivp(
         rhs,
         t_span=(0.0, t_end_star),
-        y0=x0,
+        y0=x0_main,
         method=method,
         **solver_kw,
     )
