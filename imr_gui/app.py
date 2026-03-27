@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
 from imr_gui.imr import NhkvInputs, NhkvOutputs, simulate_nhkv_lic
 from imr_gui.imr import GMODInputs, simulate_gmod_lic
 from imr_gui.imr import GMOD1Inputs, simulate_gmod1_lic
-from imr_gui.io import load_experiment_mat
+from imr_gui.io import load_experiment_mat, find_rmax_value
 from imr_gui.ui.mpl_canvas import MplCanvas
 from imr_gui.constitutive import (
     load_nhkv_model,
@@ -155,6 +155,7 @@ class AppState:
     sim_t: np.ndarray | None = None
     sim_R: np.ndarray | None = None
     sim_meta: dict | None = None  # {"Rmax": float, "t_rmax": float, "tc": float}
+    sim_out: NhkvOutputs | None = None  # full solver output for export
     P_inf: float | None = None
     rho: float | None = None
     R_eq: float | None = None
@@ -339,6 +340,9 @@ class MainWindow(QMainWindow):
         act_load_params.triggered.connect(self.on_load_params)
         act_save_params = file_menu.addAction("Save parameters (MAT)...")
         act_save_params.triggered.connect(self.on_save_params)
+        file_menu.addSeparator()
+        act_export = file_menu.addAction("Export result (.mat)...")
+        act_export.triggered.connect(self.on_export_result)
 
         module_menu = self.menuBar().addMenu("Module")
         self._act_sim = module_menu.addAction("Simulation")
@@ -1618,6 +1622,7 @@ class MainWindow(QMainWindow):
             self.state.sim_t = out.t_sim
             self.state.sim_R = out.R_sim
             self.state.sim_meta = {"Rmax": out.Rmax_sim, "t_rmax": 0.0, "tc": out.tc}
+            self.state.sim_out = out
 
             self._redraw_all()
 
@@ -1867,6 +1872,7 @@ class MainWindow(QMainWindow):
                 "t_rmax": 0.0,
                 "tc": res.tc or 1.0,
             }
+            self.state.sim_out = res.sim_out
 
         self.state.best_fit_t = None
         self.state.best_fit_R = None
@@ -1940,6 +1946,90 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Parameters saved to {path}")
         except Exception as e:
             QMessageBox.critical(self, "Save failed", f"{e}\n\n{traceback.format_exc()}")
+
+    def on_export_result(self):
+        out = self.state.sim_out
+        if out is None:
+            QMessageBox.information(
+                self, "No result",
+                "Run a simulation or fitting first before exporting."
+            )
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export result", "", "MAT files (*.mat)"
+        )
+        if not path:
+            return
+
+        try:
+            def col(arr):
+                return np.asarray(arr, dtype=float).reshape(-1, 1)
+
+            export: dict = {}
+
+            # --- simulation ---
+            export["t_sim"]        = col(out.t_sim)
+            export["R_sim"]        = col(out.R_sim)
+            export["U_sim"]        = col(out.U_sim)
+            export["P_sim"]        = col(out.P_sim)
+            export["t_sim_nondim"] = col(out.t_sim_nondim)
+            export["R_sim_nondim"] = col(out.R_sim_nondim)
+            export["Rmax_sim"]     = float(out.Rmax_sim)
+            export["tc"]           = float(out.tc)
+            export["Uc"]           = float(out.Uc)
+            export["n_damaged"]    = int(out.n_damaged)
+
+            # --- experimental (if loaded) ---
+            if self.state.exp_t is not None and self.state.exp_R is not None:
+                t_exp = self.state.exp_t
+                R_exp = self.state.exp_R
+                Rmax_exp = find_rmax_value(t_exp, R_exp)
+                P_inf_gui = float(self.spin_P_inf.value())
+                rho_gui   = float(self.spin_rho.value())
+                R_eq_gui  = float(self.spin_Req_um.value()) * 1e-6
+                Uc_gui    = float(np.sqrt(P_inf_gui / rho_gui)) if rho_gui > 0 else 1.0
+                tc_gui    = R_eq_gui / Uc_gui if Uc_gui > 0 else 1.0
+                export["t_exp"]        = col(t_exp)
+                export["R_exp"]        = col(R_exp)
+                export["t_nondim_exp"] = col(t_exp / tc_gui)
+                export["R_nondim_exp"] = col(R_exp / Rmax_exp)
+                export["Rmax_exp"]     = float(Rmax_exp)
+
+            # --- parameters (same struct format as Save parameters) ---
+            names  = list(self._param_rows.keys())
+            params = self._get_param_si()
+            n = len(names)
+            dtype = np.dtype([
+                ("name", "O"), ("value", "O"), ("lb", "O"),
+                ("ub", "O"), ("scale", "O"), ("group", "O"),
+            ])
+            arr = np.empty((1, n), dtype=dtype)
+            for i, nm in enumerate(names):
+                fw     = self._fit_widgets.get(nm, {})
+                factor = self._get_unit_factor(nm)
+                lb = float(fw["spin_lb"].value()) * factor if fw else params[nm] / 10
+                ub = float(fw["spin_ub"].value()) * factor if fw else params[nm] * 10
+                sc = fw["cmb_scale"].currentText() if fw else "lin"
+                arr[0, i]["name"]  = np.array(nm, dtype=object)
+                arr[0, i]["value"] = float(params[nm])
+                arr[0, i]["lb"]    = float(lb)
+                arr[0, i]["ub"]    = float(ub)
+                arr[0, i]["scale"] = np.array(sc, dtype=object)
+                arr[0, i]["group"] = np.array("", dtype=object)
+            export["struct_best_fit"] = arr
+
+            # --- metadata scalars ---
+            export["P_inf"]     = float(self.spin_P_inf.value())
+            export["rho"]       = float(self.spin_rho.value())
+            export["Req"]       = float(self.spin_Req_um.value()) * 1e-6
+            export["model_key"] = self._get_active_model_key()
+
+            savemat(path, export)
+            self.statusBar().showMessage(f"Result exported to {path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", f"{e}\n\n{traceback.format_exc()}")
 
     def on_load_params(self):
         path, _ = QFileDialog.getOpenFileName(

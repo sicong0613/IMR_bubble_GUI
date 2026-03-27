@@ -124,6 +124,7 @@ class FitResult:
     R_sim: NDArray[np.float64] | None = None
     Rmax_sim: float | None = None
     tc: float | None = None
+    sim_out: object | None = None  # full NhkvOutputs from the best-fit simulation
 
 
 # keep backward-compat aliases used by FitWorker
@@ -348,6 +349,7 @@ def fit_nhkv_to_experiment(
             best_params=bp, lsq_err=tracker["best_err"], nfev=tracker["nfev"],
             t_sim=bo.t_sim if bo else None, R_sim=bo.R_sim if bo else None,
             Rmax_sim=bo.Rmax_sim if bo else None, tc=bo.tc if bo else None,
+            sim_out=bo,
         )
 
     # --- build initial guess vector in optimizer space -------------------
@@ -725,4 +727,5 @@ def fit_nhkv_to_experiment(
         R_sim=best_out.R_sim if best_out else None,
         Rmax_sim=best_out.Rmax_sim if best_out else None,
         tc=best_out.tc if best_out else None,
+        sim_out=best_out,
     )

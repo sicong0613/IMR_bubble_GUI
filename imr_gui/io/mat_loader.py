@@ -158,6 +158,42 @@ def _find_rmax_time(t: NDArray[np.float64],
     return float(t_peak)
 
 
+def find_rmax_value(t: NDArray[np.float64],
+                    R: NDArray[np.float64],
+                    n_pts: int = 7) -> float:
+    """Return the sub-sample peak R by evaluating the parabolic fit at its vertex.
+
+    Uses the same windowed polyfit as ``_find_rmax_time``.  Falls back to
+    ``max(R)`` if the fit is ill-conditioned.
+    """
+    if R.size < 3:
+        return float(np.max(R))
+
+    i_max = int(np.argmax(R))
+    half  = n_pts // 2
+    i_lo  = max(0, i_max - half)
+    i_hi  = min(R.size - 1, i_max + half)
+
+    if (i_hi - i_lo + 1) < 3:
+        return float(R[i_max])
+
+    t_win = t[i_lo : i_hi + 1]
+    R_win = R[i_lo : i_hi + 1]
+
+    p = np.polyfit(t_win, R_win, 2)
+    a, b = p[0], p[1]
+
+    if a >= 0:
+        return float(R[i_max])
+
+    t_peak = -b / (2.0 * a)
+
+    if not (t_win[0] <= t_peak <= t_win[-1]):
+        return float(R[i_max])
+
+    return float(np.polyval(p, t_peak))
+
+
 def load_experiment_mat(path: str) -> ExperimentData:
     """Load experimental data from a ``.mat`` file.
 
