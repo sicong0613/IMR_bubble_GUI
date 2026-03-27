@@ -59,6 +59,7 @@ class NhkvOutputs:
     Rmax_sim: float
     tc: float
     Uc: float
+    n_damaged: int = 0  # number of damaged shells (GMOD only; 0 for NHKV)
 
 
 def _build_jac_sparsity(NT: int):

@@ -203,7 +203,7 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             GB=params_si.get("GB", 1e4),
             beta=params_si.get("beta", 1.0),
             mu=params_si.get("mu", 0.226),
-            damage_index=params_si.get("damage_index", 0),
+            lambda_Y=params_si.get("lambda_Y", 1.5),
             Req=spec.Req, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
         ))
@@ -221,7 +221,7 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             beta1=params_si.get("beta1", 1.0),
             beta2=params_si.get("beta2", 1.0),
             mu=params_si.get("mu", 0.226),
-            damage_index=params_si.get("damage_index", 0),
+            lambda_Y=params_si.get("lambda_Y", 1.5),
             Req=spec.Req, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, **spec.solver, **const_kw,
         ))
@@ -1202,7 +1202,7 @@ class MainWindow(QMainWindow):
                 GB=params.get("GB", 1e4),
                 beta=params.get("beta", 1.0),
                 mu=params.get("mu", 0.226),
-                damage_index=params.get("damage_index", 0),
+                lambda_Y=params.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
                 P_inf=P_inf, rho=rho, **solver, **const_kw,
             )
@@ -1220,7 +1220,7 @@ class MainWindow(QMainWindow):
                 beta1=params.get("beta1", 1.0),
                 beta2=params.get("beta2", 1.0),
                 mu=params.get("mu", 0.226),
-                damage_index=params.get("damage_index", 0),
+                lambda_Y=params.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
                 P_inf=P_inf, rho=rho, **solver, **const_kw,
             )
@@ -1262,7 +1262,7 @@ class MainWindow(QMainWindow):
                 GB=params_si.get("GB", 1e4),
                 beta=params_si.get("beta", 1.0),
                 mu=params_si.get("mu", 0.226),
-                damage_index=params_si.get("damage_index", 0),
+                lambda_Y=params_si.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
                 P_inf=P_inf, rho=rho, **solver, **const_kw,
             )
@@ -1281,7 +1281,7 @@ class MainWindow(QMainWindow):
                 beta1=params_si.get("beta1", 1.0),
                 beta2=params_si.get("beta2", 1.0),
                 mu=params_si.get("mu", 0.226),
-                damage_index=params_si.get("damage_index", 0),
+                lambda_Y=params_si.get("lambda_Y", 1.5),
                 Req=Req, tspan=tspan, NT=NT,
                 P_inf=P_inf, rho=rho, **solver, **const_kw,
             )
@@ -1623,10 +1623,11 @@ class MainWindow(QMainWindow):
 
             used_pinf = float(self.spin_P_inf.value())
             used_rho = float(self.spin_rho.value())
+            _dam_str = f"  |  N_dam={out.n_damaged}" if out.n_damaged > 0 else ""
             self.lbl_output.setPlainText(
                 f"Simulation ({model_key}):  Rmax={out.Rmax_sim*1e6:.3f} µm  |  "
                 f"tc={out.tc*1e6:.3f} µs  |  Uc={out.Uc:.3f} m/s  |  "
-                f"pts={out.t_sim.shape[0]}\n"
+                f"pts={out.t_sim.shape[0]}{_dam_str}\n"
                 f"  P_inf={used_pinf:.1f} Pa  |  rho={used_rho:.1f} kg/m³  |  "
                 f"Req={float(self.spin_Req_um.value()):.3f} µm  |  NT={int(self.spin_NT.value())}"
             )
@@ -1993,8 +1994,8 @@ class MainWindow(QMainWindow):
                 # Used when MATLAB 'string' type blocks name decoding.
                 _LAYOUTS: dict[int, list[str]] = {
                     11: ["U0", "GA1", "GA2", "alpha1", "alpha2",
-                         "GB1", "GB2", "beta1", "beta2", "mu", "damage_index"],
-                    7:  ["U0", "GA", "alpha", "GB", "beta", "mu", "damage_index"],
+                         "GB1", "GB2", "beta1", "beta2", "mu", "lambda_Y"],
+                    7:  ["U0", "GA", "alpha", "GB", "beta", "mu", "lambda_Y"],
                 }
 
                 m = loadmat(path, squeeze_me=True, struct_as_record=False)

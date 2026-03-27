@@ -120,12 +120,12 @@
       "fit_default": true
     },
     {
-      "name": "damage_index",
-      "label": "damage idx",
+      "name": "lambda_Y",
+      "label": "λ_Y",
       "units": [{ "label": "-", "factor": 1.0 }],
-      "default": 0,
-      "lb": 0,
-      "ub": 200,
+      "default": 1.5,
+      "lb": 1.0,
+      "ub": 10.0,
       "scale": "lin",
       "fit_default": false
     }

@@ -34,7 +34,6 @@ class GMODInputs:
     beta1: float        # dimensionless
     beta2: float        # dimensionless
     mu: float           # Pa·s
-    damage_index: float # 0..MT (rounded to int inside solver)
 
     # --- geometry / experimental ---
     Req: float          # m
@@ -56,6 +55,7 @@ class GMODInputs:
 
     # --- damage behaviour ---
     xi_constant: float = -1.0   # >=0 → uniform xi; -0.5 → always binary; -1 → auto
+    lambda_Y: float = 1.5       # yield stretch; shells with λ_r0(Rmax) ≥ λ_Y are permanently damaged
 
     # --- bubble-content constants ---
     D0: float = 24.2e-6
@@ -77,27 +77,21 @@ class GMODInputs:
 # -----------------------------------------------------------------------
 
 class _SolverHistory:
-    """Mutable tracker for stress history and damage state (captured in
-    the RHS closure, analogous to MATLAB's global ``H``).
+    """Mutable tracker for damage state (captured in the RHS closure).
 
-    ``last_t`` / ``last_S`` are only updated when the simulation time
-    genuinely advances forward.  The ODE solver also calls the RHS at
-    the *same* time point with slightly perturbed states when it builds
-    the Jacobian via finite differences; those calls must not overwrite
-    the stored (S, t) pair or the next real Sdot estimate will be wrong.
+    ``t_rmax_star`` is set from the pre-scan as a constant before the main
+    integration starts.  Every RHS call — base or Jacobian FD perturbation
+    — at any given t therefore lands in the same xi branch, giving a
+    consistent Jacobian with no solver restart.
     """
     __slots__ = (
-        "initialized", "last_t", "last_S", "Sdot_current",
-        "achieve_rmax", "WA_m",
+        "t_rmax_star", "damage_mask", "WA_m",
         "achieved_lambda_A", "achieved_lambda_B",
     )
 
     def __init__(self) -> None:
-        self.initialized: bool = False
-        self.last_t: float = 0.0
-        self.last_S: float = 0.0
-        self.Sdot_current: float = 0.0
-        self.achieve_rmax: bool = False
+        self.t_rmax_star: float = float("inf")  # set from pre-scan; inf = no switch
+        self.damage_mask: NDArray | None = None
         self.WA_m: NDArray | None = None
         self.achieved_lambda_A: NDArray | None = None
         self.achieved_lambda_B: NDArray | None = None
@@ -210,7 +204,7 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
     beta1 = max(float(inp.beta1), _EPS_ALPHA)
     beta2 = max(float(inp.beta2), _EPS_ALPHA)
     xi_constant = float(inp.xi_constant)
-    damage_idx = max(0, min(int(round(inp.damage_index)), inp.MT))
+    lambda_Y_val = float(inp.lambda_Y)
 
     Req_nondim = 1.0   # R0/Rmax = 1 for LIC
 
@@ -248,7 +242,6 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
     ).astype(float)
 
     tracker = _SolverHistory()
-    eps_val = float(np.finfo(float).eps)
 
     use_CaA2 = CaA2 < 1e10
     use_CaB2 = CaB2 < 1e10
@@ -367,31 +360,22 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         lam_ap2 = lambda_r0 ** alpha2 if use_CaA2 else None
 
         # -- damage logic --
-        if not tracker.achieve_rmax:
+        # tracker.t_rmax_star is a CONSTANT set by the pre-scan before this
+        # solve starts.  Every RHS call at a given t_star — both the base
+        # call and all Jacobian FD perturbation calls — therefore lands in
+        # the same branch, giving a consistent Jacobian.
+        if t_star < tracker.t_rmax_star:
             xi = np.ones(MT)
-            if U < eps_val:
-                tracker.achieve_rmax = True
-                tracker.achieved_lambda_A = lambda_r0.copy()
-                tracker.achieved_lambda_B = lambda_ne.copy()
-                WA_0 = (
-                    1.0 / (CaA1 * alpha1) * (lam_ap1 ** (-2) + 2 * lam_ap1 - 3)
-                )
-                if use_CaA2:
-                    WA_0 = WA_0 + 1.0 / (CaA2 * alpha2) * (
-                        lam_ap2 ** (-2) + 2 * lam_ap2 - 3
-                    )
-                tracker.WA_m = WA_0.copy()
         else:
             tensile = lambda_r0 > 1
             xi = np.ones(MT)
-            if tensile[0]:
-                xi[:damage_idx] = 0.0
-
+            if tensile[0] and tracker.damage_mask is not None:
+                xi[tracker.damage_mask] = 0.0
             if xi_constant >= 0:
                 xi[:] = xi_constant
-            elif xi_constant == -0.5:
-                xi[:damage_idx] = 0.0
-                xi[damage_idx:] = 1.0
+            elif xi_constant == -0.5 and tracker.damage_mask is not None:
+                xi[tracker.damage_mask] = 0.0
+                xi[~tracker.damage_mask] = 1.0
 
         # -- stress integral terms --
         Sint_A = xi * (1.0 / CaA1 * (lam_ap1 ** (-2) - lam_ap1))
@@ -404,30 +388,30 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
                 lambda_ne ** (-2 * beta2) - lambda_ne ** beta2
             )
 
-        S = float(np.trapz(2.0 * (Sint_A + Sint_B) / term_r, term_r))
+        Sint_integrand = 2.0 * (Sint_A + Sint_B) / term_r
+        S = float(np.trapz(Sint_integrand, term_r))
 
-        # -- Sdot from finite-difference history --
-        # IMPORTANT: the ODE solver calls rhs() multiple times at the *same*
-        # t_star when building the Jacobian via finite differences.  We must
-        # only update (last_t, last_S) when time genuinely advances; otherwise
-        # last_S gets overwritten by a perturbed state value and the next real
-        # Sdot estimate becomes incorrect.
-        if not tracker.initialized:
-            # Very first call: bootstrap the history and return Sdot = 0.
-            Sdot = 0.0
-            tracker.initialized = True
-            tracker.last_t = t_star
-            tracker.last_S = S
-        elif t_star > tracker.last_t + eps_val:
-            # Time has advanced forward: compute Sdot and update history.
-            Sdot = (S - tracker.last_S) / (t_star - tracker.last_t)
-            tracker.Sdot_current = Sdot
-            tracker.last_t = t_star
-            tracker.last_S = S
-        else:
-            # Same or earlier time (Jacobian FD call or step rejection):
-            # reuse the cached Sdot without touching last_S / last_t.
-            Sdot = tracker.Sdot_current
+        # -- Analytical Sdot (Leibniz rule for trapz with moving grid) --
+        dlr0_dt = lambda_r0 ** (-2) * R ** 2 / r0_star3 * U
+        x_dot   = R ** 2 * U / term_r ** 2
+
+        coeff_A = xi * (-alpha1 / (CaA1 * lambda_r0)) * (2.0 * lam_ap1 ** (-2) + lam_ap1)
+        if use_CaA2:
+            coeff_A = coeff_A + xi * (-alpha2 / (CaA2 * lambda_r0)) * (
+                2.0 * lam_ap2 ** (-2) + lam_ap2
+            )
+        dSintA_dt = coeff_A * dlr0_dt
+
+        dlne_dt = dlr0_dt / lnv - lambda_ne * lambda_nv_dot / lnv
+        coeff_B = (-beta1 / (CaB1 * lambda_ne)) * (2.0 * lne_bp1 ** (-2) + lne_bp1)
+        if use_CaB2:
+            coeff_B = coeff_B + (-beta2 / (CaB2 * lambda_ne)) * (
+                2.0 * lne_bp2 ** (-2) + lne_bp2
+            )
+        dSintB_dt = coeff_B * dlne_dt
+
+        f_dot = 2.0 * (dSintA_dt + dSintB_dt) / term_r - Sint_integrand * x_dot / term_r
+        Sdot  = float(np.trapz(f_dot, term_r) + np.trapz(Sint_integrand, x_dot))
 
         # ======= Keller-Miksis (no explicit viscous term) =======
         rdot = U
@@ -447,7 +431,7 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         return out
 
     # ------------------------------------------------------------------
-    # solve
+    # solve  (two-phase: pre-scan → damage_mask → main integration)
     # ------------------------------------------------------------------
     t_end_star = float(inp.tspan / tc)
 
@@ -462,6 +446,60 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
     if inp.first_step > 0.0:
         solver_kw["first_step"] = inp.first_step
 
+    # --- Phase 1: loose-tolerance pre-scan to find t_rmax and damage mask ---
+    def _rmax_event(_, x: NDArray) -> float:
+        return float(x[1])  # U = 0 at Rmax (R decreasing → U crosses zero downward)
+
+    _rmax_event.terminal = True   # type: ignore[attr-defined]
+    _rmax_event.direction = -1    # type: ignore[attr-defined]  # only detect U: + → -
+
+    prescan_kw: dict = dict(rtol=1e-6, atol=1e-6)
+    if method in ("BDF", "Radau"):
+        prescan_kw["jac_sparsity"] = jac_sparsity
+    if inp.first_step > 0.0:
+        prescan_kw["first_step"] = inp.first_step
+
+    sol_pre = solve_ivp(
+        rhs,
+        t_span=(0.0, t_end_star),
+        y0=x0,
+        method=method,
+        events=[_rmax_event],
+        **prescan_kw,
+    )
+
+    if len(sol_pre.t_events[0]) > 0:
+        t_rmax_star = float(sol_pre.t_events[0][0])
+        x_rmax = sol_pre.y_events[0][0]
+
+        R_rmax = float(x_rmax[0])
+        lnv_rmax = x_rmax[3 + 2 * NT : 3 + 2 * NT + MT]
+
+        lambda_w_rmax = R_rmax / Req_nondim
+        lambda_r0_rmax = (1.0 + (1.0 / r0_star3) * (lambda_w_rmax ** 3 - 1.0)) ** (1.0 / 3.0)
+        lambda_ne_rmax = lambda_r0_rmax / lnv_rmax
+
+        damage_mask = lambda_r0_rmax >= lambda_Y_val
+        tracker.damage_mask = damage_mask
+        tracker.achieved_lambda_A = lambda_r0_rmax.copy()
+        tracker.achieved_lambda_B = lambda_ne_rmax.copy()
+
+        lam_ap1_rmax = lambda_r0_rmax ** alpha1
+        WA_0 = 1.0 / (CaA1 * alpha1) * (lam_ap1_rmax ** (-2) + 2.0 * lam_ap1_rmax - 3.0)
+        if use_CaA2:
+            lam_ap2_rmax = lambda_r0_rmax ** alpha2
+            WA_0 = WA_0 + 1.0 / (CaA2 * alpha2) * (lam_ap2_rmax ** (-2) + 2.0 * lam_ap2_rmax - 3.0)
+        tracker.WA_m = WA_0.copy()
+
+        if xi_constant < 0.0:
+            need_damage = bool(np.any(damage_mask))
+        else:
+            need_damage = xi_constant < 1.0
+
+        if need_damage:
+            tracker.t_rmax_star = t_rmax_star
+
+    # --- Phase 2: main integration (tight tolerance, full duration) ---
     sol = solve_ivp(
         rhs,
         t_span=(0.0, t_end_star),
@@ -490,6 +528,8 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
     R_sim_nondim = R_sim / Rmax_sim
     t_sim_nondim = t_sim_shifted * Uc / Rmax_sim
 
+    n_damaged = int(np.sum(tracker.damage_mask)) if tracker.damage_mask is not None else 0
+
     return NhkvOutputs(
         t_sim=t_sim_shifted.astype(float),
         R_sim=R_sim.astype(float),
@@ -500,6 +540,7 @@ def simulate_gmod_lic(inp: GMODInputs) -> NhkvOutputs:
         Rmax_sim=Rmax_sim,
         tc=float(tc),
         Uc=float(Uc),
+        n_damaged=n_damaged,
     )
 
 
@@ -518,7 +559,6 @@ class GMOD1Inputs:
     GB: float           # Pa  — single non-equilibrium Maxwell modulus
     beta: float         # dimensionless
     mu: float           # Pa·s
-    damage_index: float # 0..MT
 
     # --- geometry / experimental ---
     Req: float          # m
@@ -540,6 +580,7 @@ class GMOD1Inputs:
 
     # --- damage ---
     xi_constant: float = -1.0
+    lambda_Y: float = 1.5       # yield stretch
 
     # --- bubble-content constants ---
     D0: float = 24.2e-6
@@ -581,7 +622,7 @@ def simulate_gmod1_lic(inp: GMOD1Inputs) -> NhkvOutputs:
         GB1=inp.GB,   GB2=1e-10,
         beta1=inp.beta,   beta2=inp.beta,
         mu=inp.mu,
-        damage_index=inp.damage_index,
+        lambda_Y=inp.lambda_Y,
         Req=inp.Req, tspan=inp.tspan,
         NT=inp.NT, MT=inp.MT,
         rel_tol=inp.rel_tol, abs_tol=inp.abs_tol,
@@ -637,7 +678,7 @@ def _simulate_gmod1_standalone(inp: GMOD1Inputs) -> NhkvOutputs:
     alpha = max(float(inp.alpha), _EPS_ALPHA)
     beta  = max(float(inp.beta),  _EPS_ALPHA)
     xi_constant = float(inp.xi_constant)
-    damage_idx = max(0, min(int(round(inp.damage_index)), inp.MT))
+    lambda_Y_val = float(inp.lambda_Y)
 
     Req_nondim = 1.0
 
@@ -788,13 +829,15 @@ def _simulate_gmod1_standalone(inp: GMOD1Inputs) -> NhkvOutputs:
                 ).copy()
         else:
             xi = np.ones(MT)
-            if (lambda_r0 > 1)[0]:
-                xi[:damage_idx] = 0.0
+            if (lambda_r0 > 1)[0] and tracker.achieved_lambda_A is not None:
+                damage_mask = tracker.achieved_lambda_A >= lambda_Y_val
+                xi[damage_mask] = 0.0
             if xi_constant >= 0:
                 xi[:] = xi_constant
-            elif xi_constant == -0.5:
-                xi[:damage_idx] = 0.0
-                xi[damage_idx:] = 1.0
+            elif xi_constant == -0.5 and tracker.achieved_lambda_A is not None:
+                damage_mask = tracker.achieved_lambda_A >= lambda_Y_val
+                xi[damage_mask] = 0.0
+                xi[~damage_mask] = 1.0
 
         Sint_A = xi * (1.0 / CaA * (lam_a ** (-2) - lam_a))
         Sint_B = 1.0 / CaB * (lambda_ne ** (-2 * beta) - lambda_ne ** beta)
