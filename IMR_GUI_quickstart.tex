@@ -1,0 +1,416 @@
+% ============================================================
+%  IMR GUI — Quick-Start Guide
+%  Compile with: pdflatex IMR_GUI_quickstart.tex  (twice)
+%  Packages required: geometry, graphicx, xcolor, tcolorbox,
+%                     booktabs, hyperref, amsmath, enumitem
+% ============================================================
+\documentclass[11pt, letterpaper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage{parskip}
+
+% --- Color palette ---
+\definecolor{noteblue}{RGB}{220, 235, 255}
+\definecolor{warnamber}{RGB}{255, 243, 205}
+\definecolor{okgreen}{RGB}{212, 237, 218}
+\definecolor{accentgray}{RGB}{90, 90, 90}
+
+% --- Callout boxes ---
+\tcbset{
+  notebox/.style={
+    colback=noteblue, colframe=blue!40!black,
+    fonttitle=\bfseries\small, title={Note}, left=4pt, right=4pt,
+    top=3pt, bottom=3pt, boxrule=0.5pt
+  },
+  warnbox/.style={
+    colback=warnamber, colframe=orange!70!black,
+    fonttitle=\bfseries\small, title={Important}, left=4pt, right=4pt,
+    top=3pt, bottom=3pt, boxrule=0.5pt
+  },
+  okbox/.style={
+    colback=okgreen, colframe=green!40!black,
+    fonttitle=\bfseries\small, title={Success Criterion}, left=4pt, right=4pt,
+    top=3pt, bottom=3pt, boxrule=0.5pt
+  },
+}
+
+% --- Step counter (integer steps) ---
+\newcounter{stepctr}
+\newcommand{\step}[1]{%
+  \stepcounter{stepctr}%
+  \vspace{6pt}
+  \noindent
+  {\large\bfseries\color{blue!60!black} Step~\thestepctr:\quad #1}
+  \vspace{2pt}\par
+}
+
+% --- Half-step (e.g. 4.5): prints current counter value + ".5", no increment ---
+\newcommand{\halfstep}[1]{%
+  \vspace{6pt}
+  \noindent
+  {\large\bfseries\color{blue!60!black} Step~\thestepctr.5:\quad #1}
+  \vspace{2pt}\par
+}
+
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, urlcolor=blue!60!black}
+
+% ============================================================
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Quick-Start Guide}\\[4pt]
+  {\large IMR Bubble Dynamics Fitting --- IMR GUI}\\[2pt]
+  {\small\color{accentgray} For first-time users. No programming required.}
+\end{center}
+
+\vspace{4pt}
+\hrule
+\vspace{8pt}
+
+% ---- Overview -----------------------------------------------
+\section*{Overview}
+
+This guide walks you through fitting a \textbf{single-bubble inertial
+microrheology (IMR)} dataset to extract the shear modulus $G$ and
+viscosity $\mu$ of a soft material using the \textbf{NHKV\,(Rmax) model}.
+Follow every step in order. If anything looks unexpected, ask your TA
+before changing settings not covered here.
+
+% ---- Step 1 -------------------------------------------------
+\step{Prepare Your Experimental Data File}
+
+Your data must be saved as a \texttt{.mat} file containing two
+one-dimensional arrays:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Quantity} & \textbf{Variable name} & \textbf{Unit} \\
+\midrule
+Bubble radius & \texttt{R} & meters (m) \\
+Time          & \texttt{t} & seconds (s) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[warnbox]
+The variable names are \textbf{case-sensitive}.
+\texttt{R} must be in \textbf{meters} (not \textmu m) and \texttt{t}
+must be in \textbf{seconds} (not \textmu s).
+If your data is in other units, convert it in MATLAB before saving.
+\end{tcolorbox}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig1_variable_name.png}
+\caption{Example MATLAB workspace showing the required variable
+  format: \texttt{R} (bubble radius, in meters) and \texttt{t}
+  (time, in seconds). Both arrays must be one-dimensional and of
+  equal length.}
+\label{fig:format_variable}
+\end{figure}
+
+% ---- Step 2 -------------------------------------------------
+\step{Launch the Software and Load Your Data}
+
+Double-click \texttt{IMR\_GUI.exe} to open the program.
+
+Once the window appears, go to \textbf{File} $\rightarrow$
+\textbf{Load experiment data (.mat)}, and select your \texttt{.mat}
+file.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig2.png}
+\caption{Opening the experimental data file via
+  \textbf{File} $\rightarrow$ \textbf{Load experiment data (.mat)}.}
+\label{fig:load_data}
+\end{figure}
+
+After loading, the experimental bubble radius vs.\ time curve will
+appear in the plot area on the right.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig3.png}
+\caption{Main window after successfully loading the dataset.
+  The experimental bubble radius--time trace is displayed in the
+  plot area. Time is shown in \textmu s (horizontal axis) and
+  normalized radius on the vertical axis.}
+\label{fig:show_data}
+\end{figure}
+
+% ---- Step 3 -------------------------------------------------
+\step{Select the Constitutive Model}
+
+In the \textbf{Model} dropdown (top-left panel), select:
+\[
+  \textbf{NHKV\,(Rmax)}
+\]
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig4.png}
+\caption{Selecting \textbf{NHKV\,(Rmax)} from the \textbf{Model}
+  dropdown in the top-left control panel.}
+\label{fig:constitutional_model}
+\end{figure}
+
+\begin{tcolorbox}[notebox]
+NHKV\,(Rmax) is recommended for IMR because it starts the simulation
+from the experimentally observed maximum radius $R_\mathrm{max}$,
+which avoids the need to specify an initial bubble-wall velocity.
+\end{tcolorbox}
+
+% ---- Step 4 -------------------------------------------------
+\step{Enter Initial Parameter Guesses and Preview the Simulation}
+
+In the \textbf{Parameters} panel, enter the following initial values:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Initial value} \\
+\midrule
+Shear modulus & $G$   & $1\times10^{4}$~Pa \\
+Viscosity     & $\mu$ & $0.1$~Pa$\cdot$s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig5.png}
+\caption{Initial parameter guesses entered in the \textbf{Parameters}
+  panel: shear modulus $G = 1\times10^{4}$~Pa and
+  viscosity $\mu = 0.1$~Pa$\cdot$s. The checkboxes on the left
+  indicate which parameters will be optimized during fitting.}
+\label{fig:initial_guess}
+\end{figure}
+
+Click \textbf{Simulate} to preview the simulated curve with the
+current parameters.
+You can try different values of $G$ and $\mu$ to explore how each
+parameter affects the shape of the simulated curve before running the
+automated fitting.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig6.png}
+\caption{Simulation preview: the simulated curve (orange) is overlaid
+  on the experimental data (blue) after clicking \textbf{Simulate}.
+  The two curves do not need to match at this stage --- this is only
+  a visual check of the initial guess.}
+\label{fig:simulation}
+\end{figure}
+
+% ---- Step 4.5 -----------------------------------------------
+\halfstep{Switch to the Fitting Module}
+
+After previewing the simulation, switch from the \textbf{Simulate}
+tab to the \textbf{Fit} tab in the left control panel. This tab
+contains all the controls needed to configure and run the automated
+fitting: the algorithm selector, parameter bounds, fit window, and
+the \textbf{Fit} button.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig6.5.png}
+\caption{Switching from the \textbf{Simulate} tab to the
+  \textbf{Fit} tab in the left control panel. All fitting-related
+  settings --- algorithm, parameter bounds, and fit window --- are
+  located in this tab.}
+\label{fig:fitting_module}
+\end{figure}
+
+% ---- Step 5 -------------------------------------------------
+\step{Set the Fitting Algorithm and Parameter Bounds}
+
+\textbf{Algorithm:} In the \textbf{Fit} tab, set the algorithm to
+\textbf{Pattern Search}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig7.png}
+\caption{Selecting \textbf{Pattern Search} from the
+  \textbf{Algorithm} dropdown in the \textbf{Fit} tab.}
+\label{fig:pattern_search}
+\end{figure}
+
+\textbf{Bounds:} Set the parameter search bounds as follows:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Lower bound (LB)} & \textbf{Upper bound (UB)} \\
+\midrule
+$G$    & $1\times10^{3}$~Pa    & $2\times10^{6}$~Pa \\
+$\mu$  & $0.01$~Pa$\cdot$s    & $1$~Pa$\cdot$s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig8.png}
+\caption{Lower bound (LB) and upper bound (UB) entered for each
+  parameter in the \textbf{Parameters} panel.
+  The optimizer will only search within these ranges.}
+\label{fig:set_bound}
+\end{figure}
+
+% ---- Step 6 -------------------------------------------------
+\step{Adjust the Fit Window}
+
+By default, fitting uses the entire time record. Restrict it to the
+\textbf{first expansion--collapse cycle} only.
+
+In the \textbf{Fit window} section, drag the boundary handles (or
+type values directly) so that the shaded region covers only the first
+cycle --- from the start of the data up to where the bubble reaches
+its first minimum radius after collapse.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig9.png}
+\caption{Fit window (shaded region) restricted to the first
+  expansion--collapse cycle. The right boundary is placed just after
+  the bubble reaches its first post-collapse minimum radius.}
+\label{fig:fitting_window}
+\end{figure}
+
+\begin{tcolorbox}[notebox]
+Fitting only the first cycle is sufficient and avoids the influence
+of secondary oscillations, which are harder to model accurately.
+\end{tcolorbox}
+
+% ---- Step 7 -------------------------------------------------
+\step{Run the Fitting}
+
+Click the \textbf{Fit} button. The optimizer will automatically adjust
+$G$ and $\mu$ to minimize the difference between the simulated and
+experimental curves.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig10.png}
+\caption{Clicking the \textbf{Fit} button to start the optimizer.
+  The status indicator shows that fitting is in progress. No further
+  user interaction is required until the optimizer finishes.}
+\label{fig:start_fitting}
+\end{figure}
+
+\textbf{You do not need to do anything while fitting is in progress.}
+The parameter values and the simulated curve will update automatically
+when the optimizer finishes.
+
+\begin{tcolorbox}[notebox]
+Fitting typically takes \textbf{1--5 minutes} depending on your
+computer. The window will remain responsive during this time.
+\end{tcolorbox}
+
+% ---- Step 8 -------------------------------------------------
+\step{Evaluate the Results}
+
+When fitting is complete, check the following two criteria:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Visual match:} The simulated curve (solid line) should
+        closely follow the experimental data (markers) during the
+        \emph{first expansion--collapse cycle}.
+        A small discrepancy in later cycles is acceptable.
+
+  \item \textbf{LSQ error:} In the \textbf{Output} panel, check the
+        value labeled \texttt{LSQErr}. An acceptable fit has:
+        \[
+          \texttt{LSQErr} < 500
+        \]
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig11.png}
+\caption{Fitting complete: the simulated curve (orange) closely
+  follows the experimental data (blue) through the first
+  expansion--collapse cycle. The \textbf{Output} panel (bottom-left)
+  reports the optimized parameters $G$ and $\mu$ and the final
+  \texttt{LSQErr}.}
+\label{fig:end_fitting}
+\end{figure}
+
+\begin{tcolorbox}[okbox]
+If both criteria are satisfied --- good visual overlap on the first
+cycle \textbf{and} \texttt{LSQErr} $< 500$ --- you have
+obtained a successful fit. Record the reported $G$ and $\mu$ values.
+\end{tcolorbox}
+
+If the fit is poor (large error or obvious mismatch), try a different
+initial guess and run again. If you are still unable to obtain a
+satisfactory fit, consult your TA.
+
+% ---- Step 9 -------------------------------------------------
+\step{Save and Submit Your Results}
+
+Go to \textbf{File} $\rightarrow$ \textbf{Export result (.mat)\ldots}
+and save the output file.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Fig/fig12.png}
+\caption{Saving the results via
+  \textbf{File} $\rightarrow$ \textbf{Export result (.mat)\ldots}.
+  The exported file contains the fitted parameters, the simulated
+  curve, and the original experimental data.}
+\label{fig:export_result}
+\end{figure}
+
+The exported \texttt{.mat} file contains the fitted parameters, the
+simulated curve, and the experimental data. \textbf{Submit this file}
+as your result.
+
+\vspace{10pt}
+\hrule
+\vspace{8pt}
+
+% ---- Troubleshooting ----------------------------------------
+\section*{Quick Troubleshooting}
+
+\begin{center}
+\begin{tabular}{p{5.5cm} p{8cm}}
+\toprule
+\textbf{Problem} & \textbf{What to do} \\
+\midrule
+Data does not load &
+  Check that your \texttt{.mat} file has variables named exactly
+  \texttt{R} (meters) and \texttt{t} (seconds). \\[4pt]
+Simulated curve is completely wrong &
+  Verify the model is set to \textbf{NHKV\,(Rmax)} and that the
+  physics constants ($P_\infty$, $\rho$) match your experiment. \\[4pt]
+\texttt{LSQErr} is very large after fitting &
+  Try a different initial guess. If $G$ is near a bound, widen the
+  bound and retry. \\[4pt]
+Anything else &
+  Ask your TA before changing any setting not covered in this guide. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{8pt}
+\begin{tcolorbox}[notebox, title={Default physics constants}]
+Unless instructed otherwise, leave all physics constants at their
+default values:
+$P_\infty = 101{,}325$~Pa,\quad
+$\rho = 998$~kg/m$^3$,\quad
+$\gamma = 0.056$~N/m.
+\end{tcolorbox}
+
+\end{document}

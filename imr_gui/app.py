@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import json
+import sys
 import traceback
 from dataclasses import dataclass
 import time
@@ -991,6 +992,9 @@ class MainWindow(QMainWindow):
     # =====================================================================
 
     def _settings_path(self) -> Path:
+        if getattr(sys, "frozen", False):
+            # PyInstaller: write next to the exe, not inside the read-only bundle
+            return Path(sys.executable).parent / "settings.json"
         return Path(__file__).parent / "settings.json"
 
     def _save_settings(self):
