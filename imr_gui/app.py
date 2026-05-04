@@ -791,7 +791,10 @@ class MainWindow(QMainWindow):
         self._spin_ps_mesh_init.setRange(1e-4, 10.0)
         self._spin_ps_mesh_init.setDecimals(4)
         self._spin_ps_mesh_init.setToolTip(
-            "Initial mesh size relative to each parameter's optimizer-space range."
+            "Initial poll step size in optimizer space.\n"
+            "For log-scaled params: step = this value in log10 units\n"
+            "  (0.3 ~= factor-of-2 step, comparable to MATLAB default).\n"
+            "For lin-scaled params: step = this value * bounds range."
         )
         fps.addRow("Initial mesh size:", self._spin_ps_mesh_init)
         self._spin_ps_expand = _SigFigSpinBox()
@@ -811,9 +814,29 @@ class MainWindow(QMainWindow):
             "0 = no search, pure GPS polling."
         )
         fps.addRow("Search points:", self._spin_ps_search)
+        self._chk_ps_debug = QCheckBox("Write debug CSV logs")
+        self._chk_ps_debug.setToolTip(
+            "Log every function evaluation and every iteration to two CSV files\n"
+            "(ps_debug_eval_<stamp>.csv and ps_debug_iter_<stamp>.csv)\n"
+            "in the working directory. Use for step-by-step comparison with MATLAB.\n"
+            "Only works in sequential mode (workers = 1)."
+        )
+        fps.addRow("Debug logging:", self._chk_ps_debug)
         self._opt_stack.addWidget(pg_ps)        # index 2
 
-        # page 3 – Differential Evolution
+        # page 3 – Newton-CG
+        pg_ncg = QWidget()
+        fncg = QFormLayout(pg_ncg)
+        lbl_ncg = QLabel(
+            "Uses finite-difference gradients in optimizer space and a bounded "
+            "sigmoid transform. Best used as a local polish step from a good "
+            "initial guess; each iteration can require several ODE solves."
+        )
+        lbl_ncg.setWordWrap(True)
+        fncg.addRow(lbl_ncg)
+        self._opt_stack.addWidget(pg_ncg)       # index 3
+
+        # page 4 – Differential Evolution
         pg_de = QWidget()
         fde = QFormLayout(pg_de)
         self._cmb_de_strategy = _NoWheelComboBox()
@@ -833,9 +856,9 @@ class MainWindow(QMainWindow):
         self._spin_de_recombination.setRange(0.0, 1.0)
         self._spin_de_recombination.setDecimals(3)
         fde.addRow("Recombination (CR):", self._spin_de_recombination)
-        self._opt_stack.addWidget(pg_de)        # index 3
+        self._opt_stack.addWidget(pg_de)        # index 4
 
-        # page 4 – CMA-ES (only present if cma installed)
+        # page 5 – CMA-ES (only present if cma installed)
         if _HAS_CMA:
             pg_cma = QWidget()
             fcma = QFormLayout(pg_cma)
@@ -897,7 +920,8 @@ class MainWindow(QMainWindow):
             "Nelder-Mead": 0,
             "Powell": 1,
             "Pattern Search": 2,
-            "Differential Evolution": 3,
+            "Newton-CG": 3,
+            "Differential Evolution": 4,
             "CMA-ES": _cma_page_idx if _HAS_CMA else 0,
             "Dual Annealing": _da_page_idx,
             "Basin Hopping": _bh_page_idx,
@@ -943,6 +967,7 @@ class MainWindow(QMainWindow):
         self._spin_ps_expand.setValue(c.ps_mesh_expansion)
         self._spin_ps_contract.setValue(c.ps_mesh_contraction)
         self._spin_ps_search.setValue(c.ps_search_pts)
+        self._chk_ps_debug.setChecked(c.ps_debug_log)
         self._cmb_de_strategy.setCurrentText(c.de_strategy)
         self._spin_de_maxiter.setValue(c.de_maxiter)
         self._spin_de_popsize.setValue(c.de_popsize)
@@ -973,6 +998,7 @@ class MainWindow(QMainWindow):
         c.ps_mesh_expansion = self._spin_ps_expand.value()
         c.ps_mesh_contraction = self._spin_ps_contract.value()
         c.ps_search_pts = self._spin_ps_search.value()
+        c.ps_debug_log = self._chk_ps_debug.isChecked()
         c.de_strategy = self._cmb_de_strategy.currentText()
         c.de_maxiter = self._spin_de_maxiter.value()
         c.de_popsize = self._spin_de_popsize.value()
@@ -1034,6 +1060,7 @@ class MainWindow(QMainWindow):
                 "ps_mesh_expansion":  c.ps_mesh_expansion,
                 "ps_initial_mesh":    c.ps_initial_mesh,
                 "ps_search_pts":      c.ps_search_pts,
+                "ps_debug_log":       c.ps_debug_log,
             },
         }
         try:
@@ -1090,6 +1117,7 @@ class MainWindow(QMainWindow):
         if "ps_mesh_expansion"  in opt: c.ps_mesh_expansion  = float(opt["ps_mesh_expansion"])
         if "ps_initial_mesh"    in opt: c.ps_initial_mesh    = float(opt["ps_initial_mesh"])
         if "ps_search_pts"      in opt: c.ps_search_pts      = int(opt["ps_search_pts"])
+        if "ps_debug_log"       in opt: c.ps_debug_log       = bool(opt["ps_debug_log"])
 
     # =====================================================================
     # dynamic parameter panel

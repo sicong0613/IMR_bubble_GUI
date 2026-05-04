@@ -7,8 +7,12 @@ handles the optimizer loop, progress reporting and stop logic.
 
 from __future__ import annotations
 
+import csv
+import time as _time
 import warnings
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
 import numpy as np
@@ -27,9 +31,10 @@ except ImportError:
 # -----------------------------------------------------------------------
 
 AVAILABLE_METHODS: list[str] = [
+    "Pattern Search",
+    "Newton-CG",
     "Nelder-Mead",
     "Powell",
-    "Pattern Search",
     "Differential Evolution",
     "CMA-ES",
     "Dual Annealing",
@@ -50,7 +55,7 @@ DE_STRATEGIES: list[str] = [
 @dataclass
 class OptConfig:
     """Optimizer settings, passed from the Settings dialog to the fit engine."""
-    method: str = "Nelder-Mead"
+    method: str = "Pattern Search"
 
     # ---- shared ----
     n_workers: int = 1          # parallel workers (DE and Pattern Search)
@@ -85,8 +90,9 @@ class OptConfig:
     ps_complete_poll: bool = False  # False = opportunistic (MATLAB default)
     ps_mesh_contraction: float = 0.5
     ps_mesh_expansion: float = 2.0
-    ps_initial_mesh: float = 1.0    # relative to param range in optimizer space
+    ps_initial_mesh: float = 0.3    # step size in optimizer space (log10 units for log params)
     ps_search_pts: int = 0          # random search points before each poll step
+    ps_debug_log: bool = False      # write per-eval and per-iter CSV debug logs
 
 
 @dataclass
@@ -366,9 +372,9 @@ def fit_nhkv_to_experiment(
     result = None
     algo = opt_config.method.lower().replace(" ", "-").replace("_", "-")
 
-    # NM/Powell/Pattern Search use a per-iteration emit; obj() should NOT
+    # NM/Powell/Pattern Search/Newton-CG use a per-iteration emit; obj() should NOT
     # emit independently (avoids duplicate lines with no step_size).
-    _emit_on_improve = algo not in ("nelder-mead", "powell", "pattern-search")
+    _emit_on_improve = algo not in ("nelder-mead", "powell", "pattern-search", "newton-cg")
 
     # ---- Nelder-Mead / Powell ----
     if algo in ("nelder-mead", "powell"):
@@ -404,6 +410,123 @@ def fit_nhkv_to_experiment(
         except _UserStop:
             result = None
 
+    # ---- Newton-CG ------------------------------------------------------
+    elif algo == "newton-cg":
+        # Newton-CG is unconstrained in SciPy.  Wrap the bounded optimizer
+        # coordinates x in an unconstrained z space via a sigmoid transform:
+        #     x = lb + (ub-lb) * sigmoid(z)
+        # This keeps log-scaled parameters inside their log bounds while still
+        # allowing Newton-CG to take free steps in z.
+        span = ub_arr - lb_arr
+        span[span == 0] = 1.0
+        eps = 1e-12
+
+        def _sigmoid(z):
+            z = np.asarray(z, dtype=float)
+            return np.where(
+                z >= 0,
+                1.0 / (1.0 + np.exp(-z)),
+                np.exp(z) / (1.0 + np.exp(z)),
+            )
+
+        def _x_to_z(x):
+            y = np.clip((x - lb_arr) / span, eps, 1.0 - eps)
+            return np.log(y / (1.0 - y))
+
+        def _z_to_x(z):
+            return lb_arr + span * _sigmoid(z)
+
+        heartbeat_interval = 30
+        stall_limit = max(120, 40 * (len(active) + 1))
+        nc_state = {
+            "last_improve_nfev": int(tracker["nfev"]),
+            "last_best": float(tracker["best_err"]),
+            "last_emit_nfev": int(tracker["nfev"]),
+            "last_emit_best": float(tracker["best_err"]),
+            "last_emit_z": _x_to_z(x0).copy(),
+        }
+
+        def _obj_z(z):
+            if tracker["nfev"] >= opt_config.max_fev:
+                raise _UserStop()
+
+            before = float(tracker["best_err"])
+            val = obj(_z_to_x(z))
+            after = float(tracker["best_err"])
+
+            if after < before:
+                nc_state["last_best"] = after
+                nc_state["last_improve_nfev"] = int(tracker["nfev"])
+            elif int(tracker["nfev"]) - int(nc_state["last_improve_nfev"]) >= stall_limit:
+                raise _UserStop()
+
+            if tracker["nfev"] >= opt_config.max_fev:
+                raise _UserStop()
+
+            if int(tracker["nfev"]) - int(nc_state["last_emit_nfev"]) >= heartbeat_interval:
+                status = (
+                    "improved"
+                    if float(tracker["best_err"]) < float(nc_state["last_emit_best"])
+                    else "refine"
+                )
+                z_now = np.asarray(z, dtype=float)
+                step = float(np.linalg.norm(z_now - nc_state["last_emit_z"]))
+                _emit_progress(step_size=step, status=status)
+                nc_state["last_emit_nfev"] = int(tracker["nfev"])
+                nc_state["last_emit_best"] = float(tracker["best_err"])
+                nc_state["last_emit_z"] = z_now.copy()
+            return val
+
+        grad_step = max(1e-5, float(opt_config.x_tol) ** 0.5)
+
+        def _jac_z(z):
+            z = np.asarray(z, dtype=float)
+            g = np.zeros_like(z)
+            for j in range(z.size):
+                if tracker["nfev"] >= opt_config.max_fev:
+                    raise _UserStop()
+                h = grad_step * max(1.0, abs(z[j]))
+                zp = z.copy()
+                zm = z.copy()
+                zp[j] += h
+                zm[j] -= h
+                fp = _obj_z(zp)
+                fm = _obj_z(zm)
+                g[j] = (fp - fm) / (2.0 * h)
+            return g
+
+        cb_state = {"prev_z": _x_to_z(x0), "prev_best": tracker["best_err"]}
+
+        def _newton_cb(zk):
+            if stop_flag and stop_flag():
+                raise _UserStop()
+            step = float(np.linalg.norm(zk - cb_state["prev_z"]))
+            cur_best = tracker["best_err"]
+            status = "improved" if cur_best < cb_state["prev_best"] else "refine"
+            cb_state["prev_z"] = np.array(zk, dtype=float).copy()
+            cb_state["prev_best"] = cur_best
+            nc_state["last_emit_nfev"] = int(tracker["nfev"])
+            nc_state["last_emit_best"] = float(tracker["best_err"])
+            nc_state["last_emit_z"] = cb_state["prev_z"].copy()
+            _emit_progress(step_size=step, status=status)
+
+        try:
+            minimize(
+                _obj_z,
+                cb_state["prev_z"].copy(),
+                method="Newton-CG",
+                jac=_jac_z,
+                callback=_newton_cb,
+                options={
+                    "xtol": opt_config.x_tol,
+                    "maxiter": max(1, opt_config.max_fev),
+                    "disp": False,
+                },
+            )
+        except _UserStop:
+            pass
+        result = None
+
     # ---- Pattern Search (GPS with GPSPositiveBasis2N) ----
     elif algo == "pattern-search":
         # Generalized Pattern Search — equivalent to MATLAB patternsearch with
@@ -419,7 +542,13 @@ def fit_nhkv_to_experiment(
 
         from concurrent.futures import ProcessPoolExecutor
 
-        ps_scale = ub_arr - lb_arr
+        # For log-scaled params the optimizer space is already log10, so a unit
+        # step of ps_initial_mesh means ±N decades.  For lin-scaled params
+        # normalise by the bounds range so ps_initial_mesh is scale-free.
+        ps_scale = np.array([
+            1.0 if sc == "log" else (ub_arr[j] - lb_arr[j])
+            for j, (_, sc) in enumerate(active)
+        ])
         ps_scale[ps_scale == 0] = 1.0
 
         delta = float(opt_config.ps_initial_mesh)
@@ -428,7 +557,12 @@ def fit_nhkv_to_experiment(
 
         rng = np.random.default_rng()
         n_active = len(active)
-        poll_dirs = [(i, s) for i in range(n_active) for s in (+1.0, -1.0)]
+        # Match MATLAB's GSSPositiveBasis2N-style order more closely:
+        # first all +basis directions, then all -basis directions.
+        poll_dirs = (
+            [(i, +1.0) for i in range(n_active)]
+            + [(i, -1.0) for i in range(n_active)]
+        )
         last_success: int | None = None
 
         n_workers = max(1, opt_config.n_workers)
@@ -442,6 +576,50 @@ def fit_nhkv_to_experiment(
                 tspan_factor=cfg.tspan_factor,
             )
 
+        # --- debug log setup (sequential path only) ---
+        _dbg = opt_config.ps_debug_log and not _mode["use_mp"]
+        _dbg_fid_eval = _dbg_fid_iter = None
+        _dbg_eval_writer = _dbg_iter_writer = None
+        _dbg_call_n = [0]
+        _dbg_iter_n = [0]
+        if _dbg:
+            _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _dbg_fid_eval = open(Path(f"ps_debug_eval_{_stamp}.csv"), "w", newline="")
+            _dbg_fid_iter = open(Path(f"ps_debug_iter_{_stamp}.csv"), "w", newline="")
+            _dbg_eval_writer = csv.writer(_dbg_fid_eval)
+            _dbg_iter_writer = csv.writer(_dbg_fid_iter)
+            _hdr_e = ["call"] + [h for nm, _ in active for h in (nm, f"log10_{nm}")] + ["LSQErr", "elapsed_s"]
+            _hdr_i = ["iter"] + [h for nm, _ in active for h in (f"{nm}_best", f"log10_{nm}_best")] + ["LSQErr_best", "meshsize", "funccount", "method"]
+            _dbg_eval_writer.writerow(_hdr_e)
+            _dbg_iter_writer.writerow(_hdr_i)
+            # log initial evaluation
+            _psi0 = _to_si_dict(x0)
+            _row0 = [0]
+            for _nm, _ in active:
+                _v = _psi0.get(_nm, float("nan"))
+                _row0 += [f"{_v:.10e}", f"{np.log10(_v):.6f}" if _v > 0 else "nan"]
+            _row0 += [f"{f_curr:.10e}", "0.0000"]
+            _dbg_eval_writer.writerow(_row0)
+            _dbg_fid_eval.flush()
+
+        def _obj_seq(theta_opt):
+            """obj() with optional per-call debug logging (sequential path)."""
+            if not _dbg:
+                return obj(theta_opt)
+            _t0 = _time.perf_counter()
+            _err = obj(theta_opt)
+            _elapsed = _time.perf_counter() - _t0
+            _dbg_call_n[0] += 1
+            _psi = _to_si_dict(theta_opt)
+            _row = [_dbg_call_n[0]]
+            for _nm, _ in active:
+                _v = _psi.get(_nm, float("nan"))
+                _row += [f"{_v:.10e}", f"{np.log10(_v):.6f}" if _v > 0 else "nan"]
+            _row += [f"{_err:.10e}", f"{_elapsed:.4f}"]
+            _dbg_eval_writer.writerow(_row)
+            _dbg_fid_eval.flush()
+            return _err
+
         def _batch_eval(pts: list) -> list[tuple]:
             """Return [(x, err), ...] for *pts*, using multiprocessing if enabled."""
             if _mode["use_mp"]:
@@ -450,7 +628,7 @@ def fit_nhkv_to_experiment(
                 return list(zip(pts, errs))
             out = []
             for xp in pts:
-                out.append((xp, obj(xp)))
+                out.append((xp, _obj_seq(xp)))
             return out
 
         _ps_pool = (
@@ -488,8 +666,12 @@ def fit_nhkv_to_experiment(
                 # --- poll step ---
                 skip_poll = improved and not opt_config.ps_complete_poll and not _mode["use_mp"]
                 if not skip_poll:
-                    # Direction ordering: last successful first, then shuffled rest
-                    if last_success is not None:
+                    # Complete poll must evaluate every direction around the
+                    # same base point, then update once.  Opportunistic poll
+                    # can prioritize the last successful direction.
+                    if opt_config.ps_complete_poll:
+                        order = list(range(len(poll_dirs)))
+                    elif last_success is not None:
                         order = [last_success] + [
                             k for k in range(len(poll_dirs)) if k != last_success
                         ]
@@ -527,22 +709,44 @@ def fit_nhkv_to_experiment(
                         else:
                             last_success = None
                     else:
-                        # Sequential: opportunistic or complete
-                        for k in order:
-                            i, sign = poll_dirs[k]
-                            x_try = x_curr.copy()
-                            x_try[i] += sign * delta * ps_scale[i]
-                            x_try = np.clip(x_try, lb_arr, ub_arr)
-                            f_try = obj(x_try)
-                            if f_try < f_curr:
-                                x_curr = x_try.copy()
-                                f_curr = f_try
-                                last_success = k
+                        # Sequential complete poll: evaluate the whole poll
+                        # set around x_curr before accepting the best point.
+                        if opt_config.ps_complete_poll:
+                            x_base = x_curr.copy()
+                            trial_pts = []
+                            for k in order:
+                                i, sign = poll_dirs[k]
+                                x_try = x_base.copy()
+                                x_try[i] += sign * delta * ps_scale[i]
+                                trial_pts.append(np.clip(x_try, lb_arr, ub_arr))
+                            results = _batch_eval(trial_pts)
+                            best_idx = int(np.argmin([r[1] for r in results]))
+                            best_x, best_f = results[best_idx]
+                            if best_f < f_curr:
+                                x_curr = best_x.copy()
+                                f_curr = best_f
+                                last_success = order[best_idx]
                                 improved = True
-                                if not opt_config.ps_complete_poll:
+                            else:
+                                last_success = None
+
+                        # Sequential opportunistic poll: accept the first
+                        # improving point and optionally stop polling early.
+                        else:
+                            for k in order:
+                                i, sign = poll_dirs[k]
+                                x_try = x_curr.copy()
+                                x_try[i] += sign * delta * ps_scale[i]
+                                x_try = np.clip(x_try, lb_arr, ub_arr)
+                                f_try = _obj_seq(x_try)
+                                if f_try < f_curr:
+                                    x_curr = x_try.copy()
+                                    f_curr = f_try
+                                    last_success = k
+                                    improved = True
                                     break
-                            if tracker["nfev"] >= opt_config.max_fev:
-                                break
+                                if tracker["nfev"] >= opt_config.max_fev:
+                                    break
 
                 # --- mesh update ---
                 if improved:
@@ -559,7 +763,29 @@ def fit_nhkv_to_experiment(
 
                 _emit_progress(step_size=delta,
                                status="improved" if improved else "refine")
+
+                # --- debug iteration log ---
+                if _dbg:
+                    _dbg_iter_n[0] += 1
+                    _bsi = tracker["best_params"] or {}
+                    _irow = [_dbg_iter_n[0]]
+                    for _nm, _ in active:
+                        _v = _bsi.get(_nm, float("nan"))
+                        _irow += [f"{_v:.10e}", f"{np.log10(_v):.6f}" if _v > 0 else "nan"]
+                    _irow += [
+                        f"{tracker['best_err']:.10e}",
+                        f"{delta:.4e}",
+                        tracker["nfev"],
+                        "Successful Poll" if improved else "Unsuccessful Poll",
+                    ]
+                    _dbg_iter_writer.writerow(_irow)
+                    _dbg_fid_iter.flush()
+
         finally:
+            if _dbg_fid_eval is not None:
+                _dbg_fid_eval.close()
+            if _dbg_fid_iter is not None:
+                _dbg_fid_iter.close()
             if _ps_pool is not None:
                 _ps_pool.shutdown(wait=False)
 

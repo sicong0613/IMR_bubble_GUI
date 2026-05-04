@@ -387,6 +387,7 @@ class NhkvRmaxInputs:
     abs_tol: float = 1e-7
     solver_method: str = "BDF"
     bubble_model: str = "Keller-Miksis"
+    vapor_wall_derivative_cutoff: bool = True
 
     # Far-field / material constants
     P_inf: float = 101325.0
@@ -444,6 +445,7 @@ def simulate_nhkv_rmax_lic(inp: NhkvRmaxInputs) -> NhkvOutputs:
     B_star = B / K_inf
     Pv_star = Pv / inp.P_inf
     _use_rp = (inp.bubble_model == "Rayleigh-Plesset")
+    _cutoff_vapor_wall_derivatives = bool(inp.vapor_wall_derivative_cutoff)
 
     Req_nondim = R0 / Rmax   # < 1 (unlike the standard NHKV where it equals 1)
 
@@ -526,6 +528,10 @@ def simulate_nhkv_rmax_lic(inp: NhkvRmaxInputs) -> NhkvOutputs:
             (2 * k[-1] - 5 * k[-2] + 4 * k[-3] - k[-4]) / (deltaY**2)
             + (2.0 / yk[-1]) * Dk[-1]
         )
+        if _cutoff_vapor_wall_derivatives:
+            # Match Example_MATLAB/code_Rmax_as_beginning/bubble.m.
+            Dk[-4:] = 0.0
+            DDk[-4:] = 0.0
 
         pdot = 3.0 / R * (
             -kappa * P * U

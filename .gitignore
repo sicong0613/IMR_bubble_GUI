@@ -20,3 +20,14 @@ dist/
 
 # Runtime settings (written by the app on first run)
 imr_gui/settings.json
+
+# test data
+Example_MATLAB/code_Rmax_as_beginning/
+
+# Fitting/debug scratch outputs
+ps_debug_*.csv
+ps_debug_*.mat
+**/ps_debug_*.csv
+**/ps_debug_*.mat
+compare_ps_logs.py
+Example_MATLAB/main_RT_optimization.m
