@@ -66,7 +66,10 @@ class MplCanvas(FigureCanvas):
         h = self.handles
 
         # Check if near a fit-window line first
-        if h.fit_window_vline_start is not None or h.fit_window_vline_end is not None:
+        if (
+            self._drag_callback is not None
+            and (h.fit_window_vline_start is not None or h.fit_window_vline_end is not None)
+        ):
             xlim = self.ax.get_xlim()
             tol = (xlim[1] - xlim[0]) * self._pick_tolerance
             x = event.xdata

@@ -23,6 +23,7 @@ imr_gui/settings.json
 
 # test data
 Example_MATLAB/code_Rmax_as_beginning/
+result_test/batch_result/
 
 # settings for development
 .claude/
