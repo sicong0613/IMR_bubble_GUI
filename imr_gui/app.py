@@ -345,6 +345,7 @@ class MainWindow(QMainWindow):
         self._model_constants: dict = {}
         self._param_rows: dict[str, dict] = {}
         self._fit_widgets: dict[str, dict] = {}
+        self._saved_ui_defaults: dict = {}
 
         self._build_menu()
         self._build_ui()
@@ -400,6 +401,8 @@ class MainWindow(QMainWindow):
         act_phys_settings.triggered.connect(self._show_physics_settings)
 
         settings_menu = self.menuBar().addMenu("Settings")
+        act_save_default = settings_menu.addAction("Save Current as Default")
+        act_save_default.triggered.connect(self.on_save_defaults)
         act_opt_settings = settings_menu.addAction("Optimizer Settings...")
         act_opt_settings.triggered.connect(self._show_optimizer_settings)
 
@@ -469,13 +472,30 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(exp_box, stretch=0)
 
-        self.btn_simulate = QPushButton("Simulate")
-        self.btn_simulate.clicked.connect(self.on_simulate)
-        left_layout.addWidget(self.btn_simulate)
+        action_grid = QGridLayout()
+        action_grid.setContentsMargins(0, 0, 0, 0)
+        action_grid.setHorizontalSpacing(6)
+        action_grid.setVerticalSpacing(6)
 
-        self.btn_fit = QPushButton("Fit")
-        self.btn_fit.clicked.connect(self.on_fit)
-        left_layout.addWidget(self.btn_fit)
+        self.btn_primary_action = QPushButton("Simulate")
+        self.btn_primary_action.clicked.connect(self._on_primary_action)
+        action_grid.addWidget(self.btn_primary_action, 0, 0)
+
+        self.btn_add_job = QPushButton("Add to job list")
+        self.btn_add_job.setEnabled(False)
+        self.btn_add_job.setToolTip("Job queue support will be added in a later version.")
+        action_grid.addWidget(self.btn_add_job, 0, 1)
+
+        self.btn_save_default = QPushButton("Save as default")
+        self.btn_save_default.clicked.connect(self.on_save_defaults)
+        action_grid.addWidget(self.btn_save_default, 1, 0)
+
+        self.btn_find_initial = QPushButton("Find initial")
+        self.btn_find_initial.setEnabled(False)
+        self.btn_find_initial.setToolTip("Initial-guess search will be added in a later version.")
+        action_grid.addWidget(self.btn_find_initial, 1, 1)
+
+        left_layout.addLayout(action_grid)
 
         # ---- right panel: preview + outputs ------------------------------
         right = QWidget()
@@ -1023,8 +1043,99 @@ class MainWindow(QMainWindow):
             return Path(sys.executable).parent / "settings.json"
         return Path(__file__).parent / "settings.json"
 
-    def _save_settings(self):
+    def _collect_parameter_defaults(self) -> dict:
+        params = {}
+        for name, row in self._param_rows.items():
+            factor = self._get_unit_factor(name)
+            fw = self._fit_widgets.get(name, {})
+            unit_combo = row.get("unit_combo")
+            unit_index = unit_combo.currentIndex() if unit_combo is not None else 0
+            params[name] = {
+                "value_si": float(row["spin"].value()) * factor,
+                "unit_index": int(unit_index),
+                "fit": bool(fw.get("chk_fit").isChecked()) if fw.get("chk_fit") else True,
+                "lb_si": float(fw["spin_lb"].value()) * factor if fw.get("spin_lb") else None,
+                "ub_si": float(fw["spin_ub"].value()) * factor if fw.get("spin_ub") else None,
+                "scale": fw["cmb_scale"].currentText() if fw.get("cmb_scale") else "lin",
+            }
+        return params
+
+    def _apply_parameter_defaults(self, params: dict):
+        for name, saved in params.items():
+            row = self._param_rows.get(name)
+            if not row:
+                continue
+
+            unit_combo = row.get("unit_combo")
+            unit_options = row.get("unit_options") or []
+            unit_index = int(saved.get("unit_index", 0))
+            if unit_combo is not None and 0 <= unit_index < len(unit_options):
+                unit_combo.blockSignals(True)
+                unit_combo.setCurrentIndex(unit_index)
+                unit_combo.blockSignals(False)
+                row["unit_index"] = unit_index
+
+            factor = self._get_unit_factor(name)
+            if factor == 0:
+                factor = 1.0
+
+            if "value_si" in saved:
+                row["spin"].setValue(float(saved["value_si"]) / factor)
+
+            fw = self._fit_widgets.get(name)
+            if fw:
+                if "fit" in saved:
+                    fw["chk_fit"].setChecked(bool(saved["fit"]))
+                if "lb_si" in saved and saved["lb_si"] is not None:
+                    fw["spin_lb"].setValue(float(saved["lb_si"]) / factor)
+                if "ub_si" in saved and saved["ub_si"] is not None:
+                    fw["spin_ub"].setValue(float(saved["ub_si"]) / factor)
+                if "scale" in saved:
+                    idx = fw["cmb_scale"].findText(str(saved["scale"]))
+                    if idx >= 0:
+                        fw["cmb_scale"].setCurrentIndex(idx)
+
+    @staticmethod
+    def _normalise_ui_defaults(ui: dict) -> dict:
+        if not isinstance(ui, dict):
+            return {}
+
+        active_model = ui.get("active_model", ui.get("model"))
+        models = ui.get("models", {})
+        if not isinstance(models, dict):
+            models = {}
+        else:
+            models = dict(models)
+
+        # Backwards compatibility with the first single-model settings schema.
+        if "parameters" in ui and ui.get("model") in AVAILABLE_MODELS:
+            model_key = ui["model"]
+            old_model = dict(models.get(model_key, {}))
+            old_model["parameters"] = ui.get("parameters", {})
+            models[model_key] = old_model
+
+        out = {
+            "active_model": active_model,
+            "Req_um": ui.get("Req_um"),
+            "tspan_us": ui.get("tspan_us"),
+            "models": models,
+        }
+        return out
+
+    def _parameter_defaults_for_model(self, model_key: str) -> dict:
+        ui = self._normalise_ui_defaults(self._saved_ui_defaults)
+        model_data = ui.get("models", {}).get(model_key, {})
+        params = model_data.get("parameters", {})
+        return params if isinstance(params, dict) else {}
+
+    def _save_settings(self, show_status: bool = False, include_ui: bool = False):
         c = self._opt_config
+        try:
+            existing = json.loads(self._settings_path().read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+        existing_ui = self._normalise_ui_defaults(existing.get("ui", {})) if isinstance(existing, dict) else {}
+
         data = {
             "physics": {
                 "bubble_model": self._bubble_model,
@@ -1063,9 +1174,29 @@ class MainWindow(QMainWindow):
                 "ps_debug_log":       c.ps_debug_log,
             },
         }
+        if include_ui:
+            current_model = self._get_active_model_key()
+            models = dict(existing_ui.get("models", {}))
+            model_data = dict(models.get(current_model, {}))
+            model_data["parameters"] = self._collect_parameter_defaults()
+            models[current_model] = model_data
+            data["ui"] = {
+                "active_model": current_model,
+                "Req_um": float(self.spin_Req_um.value()),
+                "tspan_us": float(self.spin_tspan_us.value()),
+                "models": models,
+            }
+            self._saved_ui_defaults = data["ui"]
+        elif existing_ui:
+            data["ui"] = existing_ui
+
         try:
             self._settings_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+            if show_status:
+                self.statusBar().showMessage(f"Default settings saved to {self._settings_path()}")
         except Exception:
+            if show_status:
+                QMessageBox.warning(self, "Save failed", "Could not save default settings.")
             pass
 
     def _load_settings(self):
@@ -1074,6 +1205,14 @@ class MainWindow(QMainWindow):
             data = json.loads(text)
         except Exception:
             return
+
+        ui = self._normalise_ui_defaults(data.get("ui", {}))
+        self._saved_ui_defaults = ui
+        model_key = ui.get("active_model")
+        if model_key in AVAILABLE_MODELS:
+            idx = self._cmb_model.findText(model_key)
+            if idx >= 0:
+                self._cmb_model.setCurrentIndex(idx)
 
         phys = data.get("physics", {})
         if "bubble_model" in phys:
@@ -1119,6 +1258,15 @@ class MainWindow(QMainWindow):
         if "ps_search_pts"      in opt: c.ps_search_pts      = int(opt["ps_search_pts"])
         if "ps_debug_log"       in opt: c.ps_debug_log       = bool(opt["ps_debug_log"])
 
+        if ui.get("Req_um") is not None:
+            self.spin_Req_um.setValue(float(ui["Req_um"]))
+        if ui.get("tspan_us") is not None:
+            self.spin_tspan_us.setValue(float(ui["tspan_us"]))
+        self._apply_parameter_defaults(self._parameter_defaults_for_model(self._get_active_model_key()))
+
+    def on_save_defaults(self):
+        self._save_settings(show_status=True, include_ui=True)
+
     # =====================================================================
     # dynamic parameter panel
     # =====================================================================
@@ -1132,6 +1280,7 @@ class MainWindow(QMainWindow):
         self._model_constants = model.constants
         self._param_box.setTitle(f"Parameters ({model.display_name})")
         self._rebuild_param_panel(model)
+        self._apply_parameter_defaults(self._parameter_defaults_for_model(model_key))
         self._set_mode(self.state.mode)  # refresh fit-control visibility
         # GMOD models require much tighter ODE tolerances than NHKV.
         if model_key in ("GMOD1", "GMOD2"):
@@ -1277,6 +1426,12 @@ class MainWindow(QMainWindow):
     # mode switching
     # =====================================================================
 
+    def _on_primary_action(self):
+        if self.state.mode == "fitting":
+            self.on_fit()
+        else:
+            self.on_simulate()
+
     def _set_mode(self, mode: str):
         if self._fit_worker is not None and self._fit_worker.isRunning():
             if not self._fit_worker._stop_requested:
@@ -1296,8 +1451,8 @@ class MainWindow(QMainWindow):
             fw["cmb_scale"].setEnabled(is_fitting)
 
         self._fit_window_widget.setVisible(is_fitting)
-        self.btn_fit.setEnabled(is_fitting)
-        self.btn_simulate.setEnabled(not is_fitting)
+        self.btn_primary_action.setText("Fit" if is_fitting else "Simulate")
+        self.btn_primary_action.setEnabled(True)
 
         self._act_sim.setChecked(not is_fitting)
         self._act_fit_mode.setChecked(is_fitting)
@@ -1798,7 +1953,7 @@ class MainWindow(QMainWindow):
         self.state.best_fit_R = None
         self.state.best_fit_meta = None
 
-        self.btn_simulate.setEnabled(False)
+        self.btn_primary_action.setEnabled(False)
         model_key = self._get_active_model_key()
         self.statusBar().showMessage(f"Simulating {model_key} (LIC)...")
 
@@ -1832,7 +1987,7 @@ class MainWindow(QMainWindow):
             if self._sim_dialog is not None:
                 self._sim_dialog.close()
                 self._sim_dialog = None
-            self.btn_simulate.setEnabled(self.state.mode == "simulation")
+            self.btn_primary_action.setEnabled(self.state.mode == "simulation")
 
             self.state.sim_t = out.t_sim
             self.state.sim_R = out.R_sim
@@ -1867,7 +2022,7 @@ class MainWindow(QMainWindow):
             if self._sim_dialog is not None:
                 self._sim_dialog.close()
                 self._sim_dialog = None
-            self.btn_simulate.setEnabled(self.state.mode == "simulation")
+            self.btn_primary_action.setEnabled(self.state.mode == "simulation")
             QMessageBox.critical(self, "Simulation failed", f"{msg}\n\n{tb}")
             self.statusBar().showMessage("Simulation failed")
 
@@ -1994,7 +2149,7 @@ class MainWindow(QMainWindow):
 
         self._fit_start_time = time.time()
         self._fit_timer.start()
-        self.btn_fit.setEnabled(False)
+        self.btn_primary_action.setEnabled(False)
 
         self._fit_worker.progress.connect(self._on_fit_progress)
         self._fit_worker.finished_ok.connect(self._on_fit_ok)
@@ -2079,7 +2234,7 @@ class MainWindow(QMainWindow):
             self._fit_worker.wait(5000)
             self._fit_worker = None
 
-        self.btn_fit.setEnabled(self.state.mode == "fitting")
+        self.btn_primary_action.setEnabled(self.state.mode == "fitting")
 
         bp = res.best_params
         for name, row in self._param_rows.items():
@@ -2121,7 +2276,7 @@ class MainWindow(QMainWindow):
         if self._fit_worker is not None:
             self._fit_worker.wait(5000)
             self._fit_worker = None
-        self.btn_fit.setEnabled(self.state.mode == "fitting")
+        self.btn_primary_action.setEnabled(self.state.mode == "fitting")
         QMessageBox.critical(self, "Fitting failed", f"{msg}\n\n{tb}")
         self.statusBar().showMessage("Fitting failed")
 
