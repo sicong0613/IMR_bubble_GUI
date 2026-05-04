@@ -24,6 +24,10 @@ imr_gui/settings.json
 # test data
 Example_MATLAB/code_Rmax_as_beginning/
 
+# settings for development
+.claude/
+imr_gui/settings.json
+
 # Fitting/debug scratch outputs
 ps_debug_*.csv
 ps_debug_*.mat
