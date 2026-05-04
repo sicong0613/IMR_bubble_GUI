@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QSplitter,
     QDialog,
     QDialogButtonBox,
@@ -518,6 +519,18 @@ class MainWindow(QMainWindow):
         fw_lay = QHBoxLayout(self._fit_window_widget)
         fw_lay.setContentsMargins(0, 0, 0, 0)
         fw_lay.addWidget(QLabel("Fit window:"))
+        self.chk_fit_window_cycles = QCheckBox("Auto")
+        self.chk_fit_window_cycles.setToolTip(
+            "Automatically set the fitting window from Rmax to the selected "
+            "collapse minimum."
+        )
+        fw_lay.addWidget(self.chk_fit_window_cycles)
+        self.spin_fit_window_cycles = QSpinBox()
+        self.spin_fit_window_cycles.setRange(1, 20)
+        self.spin_fit_window_cycles.setValue(1)
+        self.spin_fit_window_cycles.setToolTip("Number of collapse cycles to include.")
+        fw_lay.addWidget(self.spin_fit_window_cycles)
+        fw_lay.addWidget(QLabel("cycles"))
         fw_lay.addWidget(QLabel("t_start (µs)"))
         self.spin_t_fit_start = _NoWheelSpinBox()
         self.spin_t_fit_start.setRange(-1e9, 1e9)
@@ -535,6 +548,8 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self._fit_window_widget)
         self.spin_t_fit_start.valueChanged.connect(self._on_fit_window_changed)
         self.spin_t_fit_end.valueChanged.connect(self._on_fit_window_changed)
+        self.chk_fit_window_cycles.toggled.connect(self._on_fit_window_auto_changed)
+        self.spin_fit_window_cycles.valueChanged.connect(self._on_fit_window_cycles_changed)
 
         # Canvas wrapped with zoom sliders
         canvas_area = QWidget()
@@ -1118,6 +1133,8 @@ class MainWindow(QMainWindow):
             "active_model": active_model,
             "Req_um": ui.get("Req_um"),
             "tspan_us": ui.get("tspan_us"),
+            "fit_window_auto": ui.get("fit_window_auto"),
+            "fit_window_cycles": ui.get("fit_window_cycles"),
             "models": models,
         }
         return out
@@ -1184,6 +1201,8 @@ class MainWindow(QMainWindow):
                 "active_model": current_model,
                 "Req_um": float(self.spin_Req_um.value()),
                 "tspan_us": float(self.spin_tspan_us.value()),
+                "fit_window_auto": bool(self.chk_fit_window_cycles.isChecked()),
+                "fit_window_cycles": int(self.spin_fit_window_cycles.value()),
                 "models": models,
             }
             self._saved_ui_defaults = data["ui"]
@@ -1262,7 +1281,13 @@ class MainWindow(QMainWindow):
             self.spin_Req_um.setValue(float(ui["Req_um"]))
         if ui.get("tspan_us") is not None:
             self.spin_tspan_us.setValue(float(ui["tspan_us"]))
+        if ui.get("fit_window_cycles") is not None:
+            self.spin_fit_window_cycles.setValue(int(ui["fit_window_cycles"]))
+        if ui.get("fit_window_auto") is not None:
+            self.chk_fit_window_cycles.setChecked(bool(ui["fit_window_auto"]))
         self._apply_parameter_defaults(self._parameter_defaults_for_model(self._get_active_model_key()))
+        if self.chk_fit_window_cycles.isChecked():
+            self._apply_fit_window_cycles()
 
     def on_save_defaults(self):
         self._save_settings(show_status=True, include_ui=True)
@@ -1289,6 +1314,8 @@ class MainWindow(QMainWindow):
         else:
             self.le_rtol.setText("1e-8")
             self.le_atol.setText("1e-7")
+        if self.chk_fit_window_cycles.isChecked():
+            self._apply_fit_window_cycles()
 
     def _rebuild_param_panel(self, model: ConstitutiveModel):
         # tear down existing rows
@@ -1730,7 +1757,88 @@ class MainWindow(QMainWindow):
         if self.state.mode == "fitting":
             self._redraw_all()
 
+    def _fit_window_cycle_indices(self, cycles: int) -> tuple[int, int, int]:
+        t = self.state.exp_t
+        R = self.state.exp_R
+        if t is None or R is None or t.size == 0 or R.size == 0:
+            return 0, 0, 0
+
+        n = min(t.size, R.size)
+        R = np.asarray(R[:n], dtype=float)
+        finite = np.isfinite(R)
+        if not np.any(finite):
+            return 0, max(0, n - 1), 0
+
+        valid_idx = np.flatnonzero(finite)
+        i_max = int(valid_idx[np.argmax(R[finite])])
+        start_idx = i_max if self._get_active_model_key() == "NHKV (Rmax)" else 0
+        if i_max >= n - 2:
+            return start_idx, n - 1, 0
+
+        span = float(np.nanmax(R[finite]) - np.nanmin(R[finite]))
+        eps = max(span * 1e-6, np.finfo(float).eps)
+        minima: list[int] = []
+        i = i_max + 1
+        while i < n - 1:
+            if not np.isfinite(R[i - 1]) or not np.isfinite(R[i]) or not np.isfinite(R[i + 1]):
+                i += 1
+                continue
+
+            if R[i] <= R[i - 1] + eps:
+                j = i
+                while j + 1 < n and np.isfinite(R[j + 1]) and abs(R[j + 1] - R[i]) <= eps:
+                    j += 1
+                if j + 1 < n and np.isfinite(R[j + 1]) and R[j + 1] > R[j] + eps:
+                    minima.append(j)
+                    i = j + 1
+                    continue
+            i += 1
+
+        if not minima:
+            return start_idx, n - 1, 0
+
+        found = len(minima)
+        end_idx = minima[min(max(1, cycles) - 1, found - 1)]
+        return start_idx, end_idx, found
+
+    def _apply_fit_window_cycles(self):
+        if self.state.exp_t is None or self.state.exp_R is None:
+            return
+        cycles = int(self.spin_fit_window_cycles.value())
+        i0, i1, found = self._fit_window_cycle_indices(cycles)
+        t = self.state.exp_t
+        if t is None or t.size == 0:
+            return
+
+        self.spin_t_fit_start.blockSignals(True)
+        self.spin_t_fit_end.blockSignals(True)
+        self.spin_t_fit_start.setValue(float(t[i0]) * 1e6)
+        self.spin_t_fit_end.setValue(float(t[i1]) * 1e6)
+        self.spin_t_fit_start.blockSignals(False)
+        self.spin_t_fit_end.blockSignals(False)
+
+        if found and found < cycles:
+            self.statusBar().showMessage(
+                f"Only {found} collapse cycle(s) found; fit window uses the last one found."
+            )
+        if self.state.mode == "fitting":
+            self._redraw_all()
+
+    def _on_fit_window_auto_changed(self, checked: bool):
+        self.spin_t_fit_start.setEnabled(not checked)
+        self.spin_t_fit_end.setEnabled(not checked)
+        if checked:
+            self._apply_fit_window_cycles()
+        elif self.state.mode == "fitting":
+            self._redraw_all()
+
+    def _on_fit_window_cycles_changed(self, _value: int):
+        if self.chk_fit_window_cycles.isChecked():
+            self._apply_fit_window_cycles()
+
     def _on_fit_window_dragged(self, which: str, x_view: float):
+        if self.chk_fit_window_cycles.isChecked():
+            self.chk_fit_window_cycles.setChecked(False)
         t_s = self._time_view_to_s(x_view)
         t_us = t_s * 1e6
         spin = self.spin_t_fit_start if which == "start" else self.spin_t_fit_end
@@ -1908,6 +2016,8 @@ class MainWindow(QMainWindow):
             if self.state.exp_t is not None and self.state.exp_t.size > 0:
                 self.spin_t_fit_start.setValue(float(self.state.exp_t[0]) * 1e6)
                 self.spin_t_fit_end.setValue(float(self.state.exp_t[-1]) * 1e6)
+                if self.chk_fit_window_cycles.isChecked():
+                    self._apply_fit_window_cycles()
 
             extra = ""
             if file_info:
@@ -2081,6 +2191,9 @@ class MainWindow(QMainWindow):
             return
 
         initial_values = self._get_param_si()
+
+        if self.chk_fit_window_cycles.isChecked():
+            self._apply_fit_window_cycles()
 
         t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
         t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
