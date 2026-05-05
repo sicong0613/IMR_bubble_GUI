@@ -384,6 +384,7 @@ class MainWindow(QMainWindow):
         self._queue_stop_after_current: bool = False
         self._queue_output_dir: Path | None = None
         self._queue_current_index: int | None = None
+        self._queue_fit_worker: FitWorker | None = None
         self._opt_config: OptConfig = OptConfig()
 
         # model state
@@ -393,6 +394,7 @@ class MainWindow(QMainWindow):
         self._fit_widgets: dict[str, dict] = {}
         self._saved_ui_defaults: dict = {}
         self._jobs: list[dict] = []
+        self._editing_job_index: int | None = None
 
         self._build_menu()
         self._build_ui()
@@ -611,8 +613,10 @@ class MainWindow(QMainWindow):
         self.btn_remove_job.clicked.connect(self.on_remove_selected_job)
         self.btn_load_job = QPushButton("Load to editor")
         self.btn_load_job.setEnabled(False)
+        self.btn_load_job.clicked.connect(self.on_load_selected_job_to_editor)
         self.btn_clear_completed_jobs = QPushButton("Clear completed")
         self.btn_clear_completed_jobs.setEnabled(False)
+        self.btn_clear_completed_jobs.clicked.connect(self.on_clear_completed_jobs)
 
         job_actions_primary.addWidget(self.btn_remove_job)
         job_actions_primary.addWidget(self.btn_load_job)
@@ -1604,6 +1608,8 @@ class MainWindow(QMainWindow):
         self.state.mode = mode
         is_fitting = mode == "fitting"
         is_jobs = mode == "jobs"
+        if not is_fitting:
+            self._editing_job_index = None
 
         for fw in self._fit_widgets.values():
             fw["row_widget"].setEnabled(is_fitting)
@@ -1615,6 +1621,7 @@ class MainWindow(QMainWindow):
         self.btn_primary_action.setText("Fit" if is_fitting else "Simulate")
         self.btn_primary_action.setEnabled(not is_jobs)
         self.btn_add_job.setEnabled(is_fitting)
+        self.btn_add_job.setText("Update job" if is_fitting and self._editing_job_index is not None else "Add to job list")
         self._act_load_exp.setEnabled(not is_jobs)
         self._act_load_params.setEnabled(not is_jobs)
         self._act_save_params.setEnabled(not is_jobs)
@@ -2324,10 +2331,11 @@ class MainWindow(QMainWindow):
         self.btn_job_up.setEnabled(can_reorder and first_queued is not None and idx > first_queued)
         self.btn_job_down.setEnabled(can_reorder and last_queued is not None and idx < last_queued)
         self.btn_remove_job.setEnabled(selected and selected_status == "queued")
-        self.btn_load_job.setEnabled(False)
-        self.btn_clear_completed_jobs.setEnabled(any(
-            j.get("status") == "completed" for j in self._jobs
-        ))
+        self.btn_load_job.setEnabled(selected and selected_status != "running")
+        self.btn_clear_completed_jobs.setEnabled(
+            (not self._queue_running)
+            and any(j.get("status") == "completed" for j in self._jobs)
+        )
         self.btn_run_jobs.setEnabled(
             (not self._queue_running)
             and any(j.get("status") == "queued" for j in self._jobs)
@@ -2434,6 +2442,24 @@ class MainWindow(QMainWindow):
         job = self._build_fit_job_snapshot()
         if job is None:
             return
+        if self._editing_job_index is not None:
+            idx = self._editing_job_index
+            if 0 <= idx < len(self._jobs) and self._jobs[idx].get("status") == "queued":
+                self._jobs[idx] = job
+                self._refresh_job_table()
+                self._select_job_row(idx)
+                self._editing_job_index = None
+                self.btn_add_job.setText("Add to job list")
+                self.state.best_fit_t = None
+                self.state.best_fit_R = None
+                self.state.best_fit_meta = None
+                self._set_mode("jobs")
+                self._select_job_row(idx)
+                self.statusBar().showMessage(f"Updated job {idx + 1}: {job['experiment']['file_name']}")
+                return
+            self._editing_job_index = None
+            self.btn_add_job.setText("Add to job list")
+
         self._jobs.append(job)
         self._refresh_job_table()
         self.statusBar().showMessage(
@@ -2449,6 +2475,21 @@ class MainWindow(QMainWindow):
             return
         del self._jobs[idx]
         self._refresh_job_table()
+
+    def on_clear_completed_jobs(self):
+        if self._queue_running:
+            QMessageBox.information(
+                self,
+                "Queue running",
+                "Wait for the queue to finish before clearing completed jobs.",
+            )
+            return
+        before = len(self._jobs)
+        self._jobs = [job for job in self._jobs if job.get("status") != "completed"]
+        removed = before - len(self._jobs)
+        self._editing_job_index = None
+        self._refresh_job_table()
+        self.statusBar().showMessage(f"Cleared {removed} completed job(s).")
 
     def _select_job_row(self, idx: int):
         if 0 <= idx < len(self._jobs):
@@ -2506,6 +2547,87 @@ class MainWindow(QMainWindow):
         self._jobs.insert(first, job)
         self._refresh_job_table()
         self._select_job_row(first)
+
+    def on_load_selected_job_to_editor(self):
+        idx = self._selected_job_index()
+        if idx is None:
+            return
+        job = self._jobs[idx]
+        if job.get("status") == "running":
+            QMessageBox.information(self, "Cannot load", "The running job cannot be loaded to editor.")
+            return
+
+        model_key = job.get("model", "")
+        model_idx = self._cmb_model.findText(model_key)
+        if model_idx < 0:
+            QMessageBox.warning(self, "Unknown model", f"Cannot load unknown model: {model_key}")
+            return
+
+        self._cmb_model.setCurrentIndex(model_idx)
+        self._apply_parameter_defaults(job.get("parameters", {}))
+
+        exp = job.get("experiment", {})
+        self.state.exp_t = np.array(exp.get("t"), dtype=float).copy()
+        self.state.exp_R = np.array(exp.get("R"), dtype=float).copy()
+        self.state.exp_path = exp.get("path") or None
+        self.state.P_inf = exp.get("P_inf")
+        self.state.rho = exp.get("rho")
+        self.state.R_eq = exp.get("R_eq")
+
+        settings = job.get("experiment_settings", {})
+        if settings.get("Req_um") is not None:
+            self.spin_Req_um.setValue(float(settings["Req_um"]))
+        if settings.get("tspan_us") is not None:
+            self.spin_tspan_us.setValue(float(settings["tspan_us"]))
+
+        fit_window = job.get("fit_window", {})
+        self.chk_fit_window_cycles.setChecked(fit_window.get("mode") == "auto_cycles")
+        if fit_window.get("cycles") is not None:
+            self.spin_fit_window_cycles.setValue(int(fit_window["cycles"]))
+        if fit_window.get("t_start_s") is not None:
+            self.spin_t_fit_start.setValue(float(fit_window["t_start_s"]) * 1e6)
+        if fit_window.get("t_end_s") is not None:
+            self.spin_t_fit_end.setValue(float(fit_window["t_end_s"]) * 1e6)
+
+        phys = job.get("physics", {})
+        if phys.get("bubble_model"):
+            self._bubble_model = str(phys["bubble_model"])
+            self._act_rp.setChecked(self._bubble_model == "Rayleigh-Plesset")
+            self._act_km.setChecked(self._bubble_model != "Rayleigh-Plesset")
+        if phys.get("P_inf") is not None:
+            self.spin_P_inf.setValue(float(phys["P_inf"]))
+        if phys.get("rho") is not None:
+            self.spin_rho.setValue(float(phys["rho"]))
+        if phys.get("c_long") is not None:
+            self.spin_c_long.setValue(float(phys["c_long"]))
+        if phys.get("NT") is not None:
+            self.spin_NT.setValue(int(phys["NT"]))
+        if phys.get("solver_method"):
+            solver_idx = self._cmb_solver.findText(str(phys["solver_method"]))
+            if solver_idx >= 0:
+                self._cmb_solver.setCurrentIndex(solver_idx)
+        if phys.get("rel_tol") is not None:
+            self.le_rtol.setText(str(phys["rel_tol"]))
+        if phys.get("abs_tol") is not None:
+            self.le_atol.setText(str(phys["abs_tol"]))
+
+        if isinstance(job.get("optimizer"), dict):
+            try:
+                self._opt_config = OptConfig(**job["optimizer"])
+            except TypeError:
+                pass
+
+        self.state.sim_t = None
+        self.state.sim_R = None
+        self.state.sim_meta = None
+        self.state.best_fit_t = job.get("best_fit_t")
+        self.state.best_fit_R = job.get("best_fit_R")
+        self.state.best_fit_meta = job.get("best_fit_meta")
+        self._editing_job_index = idx if job.get("status") == "queued" else None
+        self._set_mode("fitting")
+        self.btn_add_job.setText("Update job" if self._editing_job_index is not None else "Add to job list")
+        self.statusBar().showMessage(f"Loaded job {idx + 1} to editor.")
+        self._redraw_all()
 
     @staticmethod
     def _safe_filename_part(text: str) -> str:
@@ -2676,18 +2798,18 @@ class MainWindow(QMainWindow):
         )
         self._redraw_all()
 
-        self._fit_worker = self._make_job_fit_worker(job)
-        self._fit_worker.progress.connect(self._on_queue_fit_progress)
-        self._fit_worker.finished_ok.connect(self._on_queue_fit_ok)
-        self._fit_worker.failed.connect(self._on_queue_fit_fail)
-        self._fit_worker.start()
+        self._queue_fit_worker = self._make_job_fit_worker(job)
+        self._queue_fit_worker.progress.connect(self._on_queue_fit_progress)
+        self._queue_fit_worker.finished_ok.connect(self._on_queue_fit_ok)
+        self._queue_fit_worker.failed.connect(self._on_queue_fit_fail)
+        self._queue_fit_worker.start()
         self._update_job_buttons()
 
     def _finish_queue(self, message: str):
         self._queue_running = False
         self._queue_stop_after_current = False
         self._queue_current_index = None
-        self._fit_worker = None
+        self._queue_fit_worker = None
         self._update_job_buttons()
         self.statusBar().showMessage(message)
 
@@ -2712,8 +2834,8 @@ class MainWindow(QMainWindow):
             f"{status_info}"
         )
         target = float(job.get("optimizer", {}).get("f_tol", 0.0))
-        if target > 0 and prog.best_err <= target and self._fit_worker is not None:
-            self._fit_worker.request_stop()
+        if target > 0 and prog.best_err <= target and self._queue_fit_worker is not None:
+            self._queue_fit_worker.request_stop()
             self.lbl_output.appendPlainText(
                 f"job={idx + 1}\t|\tLSQErr target reached ({target:.4e}); stopping fit"
             )
@@ -2748,9 +2870,9 @@ class MainWindow(QMainWindow):
                 job["status"] = "failed"
                 job["error"] = f"Export failed: {e}"
 
-        if self._fit_worker is not None:
-            self._fit_worker.wait(5000)
-        self._fit_worker = None
+        if self._queue_fit_worker is not None:
+            self._queue_fit_worker.wait(5000)
+        self._queue_fit_worker = None
         self._refresh_job_table()
         QTimer.singleShot(0, self._start_next_queue_job)
 
@@ -2761,9 +2883,9 @@ class MainWindow(QMainWindow):
         job = self._jobs[idx]
         job["status"] = "failed"
         job["error"] = f"{msg}\n\n{tb}"
-        if self._fit_worker is not None:
-            self._fit_worker.wait(5000)
-        self._fit_worker = None
+        if self._queue_fit_worker is not None:
+            self._queue_fit_worker.wait(5000)
+        self._queue_fit_worker = None
         self._refresh_job_table()
         QTimer.singleShot(0, self._start_next_queue_job)
 
