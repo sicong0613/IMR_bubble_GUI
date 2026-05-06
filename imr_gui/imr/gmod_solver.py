@@ -666,6 +666,7 @@ def simulate_gmod1_lic(inp: GMOD1Inputs) -> NhkvOutputs:
         NT=inp.NT, MT=inp.MT,
         rel_tol=inp.rel_tol, abs_tol=inp.abs_tol,
         solver_method=inp.solver_method,
+        bubble_model=inp.bubble_model,
         P_inf=inp.P_inf, T_inf=inp.T_inf, c_long=inp.c_long,
         rho=inp.rho, gamma=inp.gamma, xi_constant=inp.xi_constant,
         D0=inp.D0, kappa=inp.kappa, Ru=inp.Ru,

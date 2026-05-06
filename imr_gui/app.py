@@ -3426,7 +3426,8 @@ class MainWindow(QMainWindow):
         self.state.best_fit_meta = None
         self.lbl_output.setPlainText(
             f"Running queue job {next_idx + 1}/{len(self._jobs)}: "
-            f"{job['experiment']['file_name']}"
+            f"{job['experiment']['file_name']}\n"
+            f"Fitting {job.get('model', '')} with {job.get('physics', {}).get('bubble_model', 'Keller-Miksis')}"
         )
         self._prepare_chained_initial_values(job, next_idx)
         self._redraw_all()
@@ -3607,7 +3608,8 @@ class MainWindow(QMainWindow):
 
         self.btn_primary_action.setEnabled(False)
         model_key = self._get_active_model_key()
-        self.statusBar().showMessage(f"Simulating {model_key} (LIC)...")
+        bubble_model = self._bubble_model
+        self.statusBar().showMessage(f"Simulating {model_key} ({bubble_model}, LIC)...")
 
         params = self._get_param_si()
         inp = self._build_sim_inputs(params)
@@ -3615,7 +3617,7 @@ class MainWindow(QMainWindow):
 
         self._sim_worker = SimWorker(sim_fn, inp, self)
 
-        dlg = QProgressDialog(f"Simulating {model_key} (LIC)...", "", 0, 0, self)
+        dlg = QProgressDialog(f"Simulating {model_key} ({bubble_model}, LIC)...", "", 0, 0, self)
         dlg.setWindowTitle("Simulation in progress")
         dlg.setWindowModality(Qt.ApplicationModal)
         dlg.setCancelButton(None)
@@ -3651,7 +3653,7 @@ class MainWindow(QMainWindow):
             used_pinf = float(self.spin_P_inf.value())
             used_rho = float(self.spin_rho.value())
             _C = 22  # fixed column width for each data field
-            _hdr = f"Simulation ({model_key}):"
+            _hdr = f"Simulation ({model_key}, {bubble_model}):"
             _ind = " " * len(_hdr)
             _r = f"Rmax={out.Rmax_sim*1e6:.3f} µm"
             _t = f"tc={out.tc*1e6:.3f} µs"
@@ -3691,7 +3693,7 @@ class MainWindow(QMainWindow):
         else:
             eta = None
         model_key = self._get_active_model_key()
-        msg = f"Simulating {model_key} (LIC)...\nElapsed {self._sec_to_hms(elapsed)}"
+        msg = f"Simulating {model_key} ({self._bubble_model}, LIC)...\nElapsed {self._sec_to_hms(elapsed)}"
         if eta is not None:
             msg += f"  |  ETA {self._sec_to_hms(eta)}"
         self._sim_dialog.setLabelText(msg)
@@ -3788,7 +3790,9 @@ class MainWindow(QMainWindow):
         self.state.best_fit_t = None
         self.state.best_fit_R = None
         self.state.best_fit_meta = None
-        self.lbl_output.clear()
+        model_key = self._get_active_model_key()
+        bubble_model = self._bubble_model
+        self.lbl_output.setPlainText(f"Fitting {model_key} with {bubble_model}")
         self._redraw_all()
 
         self._fit_worker = FitWorker(
@@ -3796,8 +3800,7 @@ class MainWindow(QMainWindow):
             opt_config=self._opt_config, parent=self,
         )
 
-        model_key = self._get_active_model_key()
-        dlg = QProgressDialog(f"Fitting {model_key} to experiment...", "Stop", 0, 0, self)
+        dlg = QProgressDialog(f"Fitting {model_key} with {bubble_model} to experiment...", "Stop", 0, 0, self)
         dlg.setWindowTitle("Fitting in progress")
         dlg.setWindowModality(Qt.NonModal)
         dlg.setMinimumDuration(0)

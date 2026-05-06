@@ -22,8 +22,10 @@ dist/
 imr_gui/settings.json
 
 # test data
-Example_MATLAB/code_Rmax_as_beginning/
 result_test/
+
+# Demo
+IMR_fitting_GUI_DEMO/
 
 # settings for development
 .claude/
@@ -36,3 +38,4 @@ ps_debug_*.mat
 **/ps_debug_*.mat
 compare_ps_logs.py
 Example_MATLAB/main_RT_optimization.m
+Example_MATLAB/code_Rmax_as_beginning/

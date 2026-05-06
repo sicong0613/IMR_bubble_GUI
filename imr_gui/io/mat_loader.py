@@ -127,6 +127,11 @@ def _find_rmax_time(t: NDArray[np.float64],
     Falls back to the raw argmax time if the fit is ill-conditioned
     (e.g. parabola opens upward, or fitted peak lies outside the window).
     """
+    finite = np.isfinite(t) & np.isfinite(R)
+    t = t[finite]
+    R = R[finite]
+    if R.size == 0:
+        return float("nan")
     if R.size < 3:
         return float(t[np.argmax(R)])
 
@@ -171,6 +176,11 @@ def find_rmax_value(t: NDArray[np.float64],
     Uses the same windowed polyfit as ``_find_rmax_time``.  Falls back to
     ``max(R)`` if the fit is ill-conditioned.
     """
+    finite = np.isfinite(t) & np.isfinite(R)
+    t = t[finite]
+    R = R[finite]
+    if R.size == 0:
+        return float("nan")
     if R.size < 3:
         return float(np.max(R))
 
@@ -228,6 +238,15 @@ def load_experiment_mat(path: str) -> ExperimentData:
             f"Got len(t)={t.shape[0]} (key={t_key!r}), "
             f"len(R)={R.shape[0]} (key={R_key!r})"
         )
+
+    finite = np.isfinite(t) & np.isfinite(R)
+    if int(np.count_nonzero(finite)) < 3:
+        raise ValueError(
+            f"Experiment data must contain at least 3 finite t/R pairs. "
+            f"Found {int(np.count_nonzero(finite))}."
+        )
+    t = t[finite]
+    R = R[finite]
 
     order = np.argsort(t)
     t = t[order]
