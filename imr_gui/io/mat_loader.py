@@ -6,6 +6,7 @@ from typing import Iterable
 import numpy as np
 from numpy.typing import NDArray
 from scipy.io import loadmat
+from scipy.signal import medfilt
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,11 @@ def _find_rmax_time(t: NDArray[np.float64],
     if R.size < 3:
         return float(t[np.argmax(R)])
 
-    i_max = int(np.argmax(R))
+    # Use median-filtered R to find peak index so that isolated single-frame
+    # detector artifacts (common in first/last frames) don't hijack argmax.
+    kernel = min(5, R.size if R.size % 2 == 1 else R.size - 1)
+    R_smooth = medfilt(R, kernel_size=kernel)
+    i_max = int(np.argmax(R_smooth))
     half  = n_pts // 2
     i_lo  = max(0, i_max - half)
     i_hi  = min(R.size - 1, i_max + half)
@@ -169,7 +174,9 @@ def find_rmax_value(t: NDArray[np.float64],
     if R.size < 3:
         return float(np.max(R))
 
-    i_max = int(np.argmax(R))
+    kernel = min(5, R.size if R.size % 2 == 1 else R.size - 1)
+    R_smooth = medfilt(R, kernel_size=kernel)
+    i_max = int(np.argmax(R_smooth))
     half  = n_pts // 2
     i_lo  = max(0, i_max - half)
     i_hi  = min(R.size - 1, i_max + half)

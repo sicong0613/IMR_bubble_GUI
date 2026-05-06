@@ -1,10 +1,20 @@
-# IMR Bubble GUI
+# IMR Fitting GUI
+
+**Beta 1.1**
 
 A Python desktop application for inertial microrheology (IMR) bubble simulation and parameter fitting, replacing the original MATLAB `patternsearch + IMR` workflow.
 
 ---
 
 ## Features
+
+- **Job list workflow** - queue fitting jobs, reorder queued jobs, run the queue, stop the queue, clear completed jobs, and preview each job's experiment, fit window, and best-fit curve.
+
+- **Batch job creation** - batch-add multiple experiment `.mat` files as fitting jobs using the current Fitting module settings as the template.
+
+- **Job queue import / export** - save and load `.imrqueue` archives containing job metadata, experiment data, previews, and result MAT files.
+
+- **Queue handoff option** - optionally seed each queued job from the previous job's best-fit parameters when job type and model match exactly.
 
 - **Multiple constitutive models** — select at runtime via the Model menu:
   - **NHKV** — Neo-Hookean Kelvin-Voigt
@@ -70,6 +80,8 @@ On Windows with multiple Python versions installed:
 ```bash
 py -3.11 -m imr_gui
 ```
+
+The main window title should read `IMR Fitting GUI (beta 1.1)`.
 
 ---
 

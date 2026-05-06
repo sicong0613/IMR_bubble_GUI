@@ -5,9 +5,11 @@ import json
 import sys
 import traceback
 from dataclasses import asdict, dataclass
+from io import BytesIO
 import time
 import math
 import re
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -363,7 +365,7 @@ class FitWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IMR Fitting GUI (prototype)")
+        self.setWindowTitle("IMR Fitting GUI (beta 1.1)")
         self.resize(1200, 700)
 
         self.state = AppState()
@@ -386,6 +388,12 @@ class MainWindow(QMainWindow):
         self._queue_current_index: int | None = None
         self._queue_fit_worker: FitWorker | None = None
         self._opt_config: OptConfig = OptConfig()
+        self._job_success_threshold_enabled: bool = True
+        self._job_success_lsqerr: float = 10.0
+        self._job_output_dir: str = ""
+        self._job_ask_output_dir: bool = True
+        self._job_chain_best_fit_initial: bool = False
+        self._queue_previous_seed: dict | None = None
 
         # model state
         self._current_model: ConstitutiveModel | None = None
@@ -419,6 +427,13 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._act_export_result = file_menu.addAction("Export result (.mat)...")
         self._act_export_result.triggered.connect(self.on_export_result)
+        file_menu.addSeparator()
+        self._act_import_jobs = file_menu.addAction("Import job queue (.imrqueue)...")
+        self._act_import_jobs.triggered.connect(self.on_import_job_queue)
+        self._act_export_jobs = file_menu.addAction("Export job queue (.imrqueue)...")
+        self._act_export_jobs.triggered.connect(self.on_export_job_queue)
+        self._act_batch_add_jobs = file_menu.addAction("Batch add experiments as jobs...")
+        self._act_batch_add_jobs.triggered.connect(self.on_batch_add_experiments_as_jobs)
 
         module_menu = self.menuBar().addMenu("Module")
         self._act_sim = module_menu.addAction("Simulation")
@@ -458,6 +473,8 @@ class MainWindow(QMainWindow):
         act_save_default.triggered.connect(self.on_save_defaults)
         act_opt_settings = settings_menu.addAction("Optimizer Settings...")
         act_opt_settings.triggered.connect(self._show_optimizer_settings)
+        act_job_settings = settings_menu.addAction("Job List Settings...")
+        act_job_settings.triggered.connect(self._show_job_settings)
 
     # =====================================================================
     # UI build
@@ -566,7 +583,7 @@ class MainWindow(QMainWindow):
         self.btn_run_jobs = QPushButton("Run queue")
         self.btn_run_jobs.setEnabled(False)
         self.btn_run_jobs.clicked.connect(self.on_run_queue)
-        self.btn_stop_jobs = QPushButton("Stop after current")
+        self.btn_stop_jobs = QPushButton("Stop queue")
         self.btn_stop_jobs.setEnabled(False)
         self.btn_stop_jobs.clicked.connect(self.on_stop_queue_after_current)
         job_header_lay.addWidget(self.btn_run_jobs)
@@ -867,6 +884,84 @@ class MainWindow(QMainWindow):
             self._build_optimizer_settings_dlg()
         self._opt_dlg_load()   # sync widgets → self._opt_config
         self._opt_dlg.exec()
+
+    def _show_job_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Job List Settings")
+        dlg.setMinimumSize(760, 220)
+        lay = QVBoxLayout(dlg)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+
+        chk_threshold = QCheckBox("Mark job failed when LSQErr exceeds")
+        chk_threshold.setChecked(self._job_success_threshold_enabled)
+        spin_threshold = _SigFigSpinBox()
+        spin_threshold.setRange(0.0, 1e15)
+        spin_threshold.setDecimals(6)
+        spin_threshold.setValue(float(self._job_success_lsqerr))
+        spin_threshold.setToolTip(
+            "Final queue jobs with LSQErr above this value are marked failed. "
+            "This is separate from optimizer f_tol."
+        )
+        spin_threshold.setEnabled(chk_threshold.isChecked())
+        chk_threshold.toggled.connect(spin_threshold.setEnabled)
+
+        output_row = QHBoxLayout()
+        le_output_dir = QLineEdit(self._job_output_dir)
+        le_output_dir.setPlaceholderText("Choose output folder...")
+        btn_browse = QPushButton("Browse...")
+        output_row.addWidget(le_output_dir, stretch=1)
+        output_row.addWidget(btn_browse)
+
+        chk_ask_dir = QCheckBox("Ask before running queue")
+        chk_ask_dir.setChecked(self._job_ask_output_dir)
+        chk_chain_initial = QCheckBox("Use previous job best fit as next initial")
+        chk_chain_initial.setChecked(self._job_chain_best_fit_initial)
+        chk_chain_initial.setToolTip(
+            "When running a queue, seed each queued job with the previous completed job's "
+            "best-fit parameters if both jobs use the same model."
+        )
+
+        def _browse_output_dir():
+            start_dir = le_output_dir.text().strip()
+            if not start_dir or not Path(start_dir).exists():
+                start_dir = ""
+            path = QFileDialog.getExistingDirectory(self, "Select default job output folder", start_dir)
+            if path:
+                le_output_dir.setText(path)
+
+        btn_browse.clicked.connect(_browse_output_dir)
+
+        grid.addWidget(chk_threshold, 0, 0)
+        grid.addWidget(QLabel("Success LSQErr threshold:"), 0, 1)
+        grid.addWidget(spin_threshold, 0, 2)
+        grid.addWidget(chk_ask_dir, 1, 0)
+        grid.addWidget(QLabel("Default output folder:"), 1, 1)
+        grid.addLayout(output_row, 1, 2)
+        grid.addWidget(chk_chain_initial, 2, 0, 1, 3)
+        grid.setColumnStretch(2, 1)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+
+        def _save():
+            self._job_success_threshold_enabled = chk_threshold.isChecked()
+            self._job_success_lsqerr = float(spin_threshold.value())
+            self._job_output_dir = le_output_dir.text().strip()
+            self._job_ask_output_dir = chk_ask_dir.isChecked()
+            self._job_chain_best_fit_initial = chk_chain_initial.isChecked()
+            self._save_settings()
+            dlg.accept()
+
+        btn_box.accepted.connect(_save)
+        btn_box.rejected.connect(dlg.reject)
+        lay.addWidget(btn_box)
+        dlg.exec()
 
     def _build_optimizer_settings_dlg(self):
         from PySide6.QtWidgets import (
@@ -1324,6 +1419,13 @@ class MainWindow(QMainWindow):
                 "ps_search_pts":      c.ps_search_pts,
                 "ps_debug_log":       c.ps_debug_log,
             },
+            "job_list": {
+                "success_threshold_enabled": self._job_success_threshold_enabled,
+                "success_lsqerr": self._job_success_lsqerr,
+                "output_dir": self._job_output_dir,
+                "ask_output_dir": self._job_ask_output_dir,
+                "chain_best_fit_initial": self._job_chain_best_fit_initial,
+            },
         }
         if include_ui:
             current_model = self._get_active_model_key()
@@ -1410,6 +1512,18 @@ class MainWindow(QMainWindow):
         if "ps_initial_mesh"    in opt: c.ps_initial_mesh    = float(opt["ps_initial_mesh"])
         if "ps_search_pts"      in opt: c.ps_search_pts      = int(opt["ps_search_pts"])
         if "ps_debug_log"       in opt: c.ps_debug_log       = bool(opt["ps_debug_log"])
+
+        job_list = data.get("job_list", {})
+        if "success_threshold_enabled" in job_list:
+            self._job_success_threshold_enabled = bool(job_list["success_threshold_enabled"])
+        if "success_lsqerr" in job_list:
+            self._job_success_lsqerr = float(job_list["success_lsqerr"])
+        if "output_dir" in job_list:
+            self._job_output_dir = str(job_list["output_dir"])
+        if "ask_output_dir" in job_list:
+            self._job_ask_output_dir = bool(job_list["ask_output_dir"])
+        if "chain_best_fit_initial" in job_list:
+            self._job_chain_best_fit_initial = bool(job_list["chain_best_fit_initial"])
 
         if ui.get("Req_um") is not None:
             self.spin_Req_um.setValue(float(ui["Req_um"]))
@@ -1626,6 +1740,7 @@ class MainWindow(QMainWindow):
         self._act_load_params.setEnabled(not is_jobs)
         self._act_save_params.setEnabled(not is_jobs)
         self._act_export_result.setEnabled(not is_jobs)
+        self._act_batch_add_jobs.setEnabled(is_fitting)
 
         self._act_sim.setChecked(mode == "simulation")
         self._act_fit_mode.setChecked(is_fitting)
@@ -1926,8 +2041,20 @@ class MainWindow(QMainWindow):
             self._redraw_all()
 
     def _fit_window_cycle_indices(self, cycles: int) -> tuple[int, int, int]:
-        t = self.state.exp_t
-        R = self.state.exp_R
+        return self._fit_window_cycle_indices_for(
+            self.state.exp_t,
+            self.state.exp_R,
+            cycles,
+            self._get_active_model_key(),
+        )
+
+    @staticmethod
+    def _fit_window_cycle_indices_for(
+        t: np.ndarray | None,
+        R: np.ndarray | None,
+        cycles: int,
+        model_key: str,
+    ) -> tuple[int, int, int]:
         if t is None or R is None or t.size == 0 or R.size == 0:
             return 0, 0, 0
 
@@ -1939,7 +2066,7 @@ class MainWindow(QMainWindow):
 
         valid_idx = np.flatnonzero(finite)
         i_max = int(valid_idx[np.argmax(R[finite])])
-        start_idx = i_max if self._get_active_model_key() == "NHKV (Rmax)" else 0
+        start_idx = i_max if model_key == "NHKV (Rmax)" else 0
         if i_max >= n - 2:
             return start_idx, n - 1, 0
 
@@ -2295,6 +2422,16 @@ class MainWindow(QMainWindow):
         ]
         if job.get("lsq_err") is not None:
             lines.append(f"LSQErr: {job['lsq_err']:.6g}")
+        best_params = job.get("best_params")
+        if isinstance(best_params, dict) and best_params:
+            lines.append("Best-fit parameters:")
+            for name, value in best_params.items():
+                try:
+                    lines.append(f"  {name} = {float(value):.6g}")
+                except Exception:
+                    lines.append(f"  {name} = {value}")
+        elif job.get("error"):
+            lines.append(f"Error: {job['error']}")
         return "\n".join(lines)
 
     def _refresh_job_table(self):
@@ -2321,6 +2458,7 @@ class MainWindow(QMainWindow):
         idx = self._selected_job_index()
         selected = idx is not None
         selected_status = self._jobs[idx].get("status", "queued") if selected else ""
+        editable_statuses = ("queued", "failed")
         can_reorder = selected and selected_status == "queued" and not self._queue_running
         queued_indices = [
             i for i, job in enumerate(self._jobs) if job.get("status", "queued") == "queued"
@@ -2330,7 +2468,7 @@ class MainWindow(QMainWindow):
         self.btn_job_top.setEnabled(can_reorder and first_queued is not None and idx != first_queued)
         self.btn_job_up.setEnabled(can_reorder and first_queued is not None and idx > first_queued)
         self.btn_job_down.setEnabled(can_reorder and last_queued is not None and idx < last_queued)
-        self.btn_remove_job.setEnabled(selected and selected_status == "queued")
+        self.btn_remove_job.setEnabled(selected and selected_status in editable_statuses)
         self.btn_load_job.setEnabled(selected and selected_status != "running")
         self.btn_clear_completed_jobs.setEnabled(
             (not self._queue_running)
@@ -2341,6 +2479,93 @@ class MainWindow(QMainWindow):
             and any(j.get("status") == "queued" for j in self._jobs)
         )
         self.btn_stop_jobs.setEnabled(self._queue_running and not self._queue_stop_after_current)
+
+    def _build_fit_job_snapshot_from_data(
+        self,
+        *,
+        exp_t: np.ndarray,
+        exp_R: np.ndarray,
+        exp_path: str,
+        exp_name: str,
+        exp_P_inf: float | None,
+        exp_rho: float | None,
+        exp_R_eq: float | None,
+        fit_flags: dict[str, bool],
+        scales: dict[str, str],
+        bounds_si: dict[str, tuple[float, float]],
+    ) -> tuple[dict | None, str | None]:
+        if exp_t is None or exp_R is None or exp_t.size == 0 or exp_R.size == 0:
+            return None, "Experiment data is empty."
+        if exp_t.shape[0] != exp_R.shape[0]:
+            return None, f"t/R length mismatch: {exp_t.shape[0]} vs {exp_R.shape[0]}."
+        if not any(fit_flags.values()):
+            return None, "No parameters are selected for fitting."
+
+        model_key = self._get_active_model_key()
+        if self.chk_fit_window_cycles.isChecked():
+            cycles = int(self.spin_fit_window_cycles.value())
+            i0, i1, _found = self._fit_window_cycle_indices_for(exp_t, exp_R, cycles, model_key)
+            t_start_s = float(exp_t[i0])
+            t_end_s = float(exp_t[i1])
+            window_mode = "auto_cycles"
+        else:
+            t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
+            t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
+            cycles = int(self.spin_fit_window_cycles.value())
+            window_mode = "manual"
+        if t_start_s > t_end_s:
+            t_start_s, t_end_s = t_end_s, t_start_s
+
+        mask = (exp_t >= t_start_s) & (exp_t <= t_end_s)
+        n_points = int(np.count_nonzero(mask))
+        if n_points < 3:
+            return None, f"Fit window contains fewer than 3 points ({n_points})."
+
+        return {
+            "version": 1,
+            "type": "fit",
+            "status": "queued",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "experiment": {
+                "path": exp_path,
+                "file_name": exp_name,
+                "t": np.array(exp_t, dtype=float).copy(),
+                "R": np.array(exp_R, dtype=float).copy(),
+                "P_inf": exp_P_inf,
+                "rho": exp_rho,
+                "R_eq": exp_R_eq,
+            },
+            "model": model_key,
+            "constants": dict(self._model_constants),
+            "parameters": self._collect_parameter_defaults(),
+            "initial_values": self._get_param_si(),
+            "fit_flags": dict(fit_flags),
+            "scales": dict(scales),
+            "bounds_si": dict(bounds_si),
+            "experiment_settings": {
+                "Req_um": float(self.spin_Req_um.value()),
+                "tspan_us": float(self.spin_tspan_us.value()),
+            },
+            "fit_window": {
+                "mode": window_mode,
+                "cycles": cycles,
+                "t_start_s": float(t_start_s),
+                "t_end_s": float(t_end_s),
+                "n_points": n_points,
+            },
+            "physics": {
+                "bubble_model": self._bubble_model,
+                "P_inf": float(self.spin_P_inf.value()),
+                "rho": float(self.spin_rho.value()),
+                "c_long": float(self.spin_c_long.value()),
+                "NT": int(self.spin_NT.value()),
+                **self._get_solver_settings(),
+            },
+            "optimizer": asdict(self._opt_config),
+            "result": None,
+            "lsq_err": None,
+            "error": None,
+        }, None
 
     def _on_job_selection_changed(self):
         idx = self._selected_job_index()
@@ -2368,69 +2593,23 @@ class MainWindow(QMainWindow):
         if self.chk_fit_window_cycles.isChecked():
             self._apply_fit_window_cycles()
 
-        t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
-        t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
-        if t_start_s > t_end_s:
-            t_start_s, t_end_s = t_end_s, t_start_s
-
-        t_exp = self.state.exp_t
-        R_exp = self.state.exp_R
-        mask = (t_exp >= t_start_s) & (t_exp <= t_end_s)
-        if int(np.count_nonzero(mask)) < 3:
-            QMessageBox.warning(
-                self, "Too few points",
-                "The fit window contains fewer than 3 data points.",
-            )
-            return None
-
         exp_path = self.state.exp_path or ""
         exp_name = Path(exp_path).name if exp_path else "loaded experiment"
-        model_key = self._get_active_model_key()
-        return {
-            "version": 1,
-            "type": "fit",
-            "status": "queued",
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "experiment": {
-                "path": exp_path,
-                "file_name": exp_name,
-                "t": np.array(t_exp, dtype=float).copy(),
-                "R": np.array(R_exp, dtype=float).copy(),
-                "P_inf": self.state.P_inf,
-                "rho": self.state.rho,
-                "R_eq": self.state.R_eq,
-            },
-            "model": model_key,
-            "constants": dict(self._model_constants),
-            "parameters": self._collect_parameter_defaults(),
-            "initial_values": self._get_param_si(),
-            "fit_flags": fit_flags,
-            "scales": scales,
-            "bounds_si": bounds_si,
-            "experiment_settings": {
-                "Req_um": float(self.spin_Req_um.value()),
-                "tspan_us": float(self.spin_tspan_us.value()),
-            },
-            "fit_window": {
-                "mode": "auto_cycles" if self.chk_fit_window_cycles.isChecked() else "manual",
-                "cycles": int(self.spin_fit_window_cycles.value()),
-                "t_start_s": float(t_start_s),
-                "t_end_s": float(t_end_s),
-                "n_points": int(np.count_nonzero(mask)),
-            },
-            "physics": {
-                "bubble_model": self._bubble_model,
-                "P_inf": float(self.spin_P_inf.value()),
-                "rho": float(self.spin_rho.value()),
-                "c_long": float(self.spin_c_long.value()),
-                "NT": int(self.spin_NT.value()),
-                **self._get_solver_settings(),
-            },
-            "optimizer": asdict(self._opt_config),
-            "result": None,
-            "lsq_err": None,
-            "error": None,
-        }
+        job, error = self._build_fit_job_snapshot_from_data(
+            exp_t=self.state.exp_t,
+            exp_R=self.state.exp_R,
+            exp_path=exp_path,
+            exp_name=exp_name,
+            exp_P_inf=self.state.P_inf,
+            exp_rho=self.state.rho,
+            exp_R_eq=self.state.R_eq,
+            fit_flags=fit_flags,
+            scales=scales,
+            bounds_si=bounds_si,
+        )
+        if job is None:
+            QMessageBox.warning(self, "Cannot add job", error or "Could not build fit job.")
+        return job
 
     def on_add_job(self):
         if self.state.mode != "fitting":
@@ -2444,7 +2623,7 @@ class MainWindow(QMainWindow):
             return
         if self._editing_job_index is not None:
             idx = self._editing_job_index
-            if 0 <= idx < len(self._jobs) and self._jobs[idx].get("status") == "queued":
+            if 0 <= idx < len(self._jobs) and self._jobs[idx].get("status") in ("queued", "failed"):
                 self._jobs[idx] = job
                 self._refresh_job_table()
                 self._select_job_row(idx)
@@ -2466,12 +2645,97 @@ class MainWindow(QMainWindow):
             f"Added job {len(self._jobs)}: {job['experiment']['file_name']}"
         )
 
+    def on_batch_add_experiments_as_jobs(self):
+        if self.state.mode != "fitting":
+            QMessageBox.information(
+                self,
+                "Fitting mode required",
+                "Switch to Fitting mode before batch-adding experiments as jobs.",
+            )
+            return
+
+        fit_flags, scales, bounds_si = self._collect_fit_setup()
+        if not any(fit_flags.values()):
+            QMessageBox.warning(
+                self,
+                "No parameters selected",
+                "Enable the Fit checkbox for at least one parameter before batch-adding jobs.",
+            )
+            return
+
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Batch add experiments as jobs",
+            "",
+            "MAT files (*.mat)",
+        )
+        if not paths:
+            return
+
+        added: list[dict] = []
+        skipped: list[str] = []
+        progress = QProgressDialog("Preparing batch jobs...", "", 0, len(paths), self)
+        progress.setWindowTitle("Batch add jobs")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        try:
+            for i, path in enumerate(paths, start=1):
+                progress.setLabelText(f"Loading {i}/{len(paths)}: {Path(path).name}")
+                progress.setValue(i - 1)
+                QApplication.processEvents()
+                try:
+                    exp = load_experiment_mat(path)
+                    exp_R_eq = exp.R_eq
+                    if exp_R_eq is None and exp.R.size > 0:
+                        exp_R_eq = float(np.mean(exp.R[-min(20, exp.R.size):]))
+                    job, error = self._build_fit_job_snapshot_from_data(
+                        exp_t=exp.t,
+                        exp_R=exp.R,
+                        exp_path=exp.source_path,
+                        exp_name=Path(exp.source_path).name,
+                        exp_P_inf=exp.P_inf,
+                        exp_rho=exp.rho,
+                        exp_R_eq=exp_R_eq,
+                        fit_flags=fit_flags,
+                        scales=scales,
+                        bounds_si=bounds_si,
+                    )
+                    if job is None:
+                        skipped.append(f"{Path(path).name}: {error or 'could not build job'}")
+                        continue
+                    added.append(job)
+                except Exception as e:
+                    skipped.append(f"{Path(path).name}: {e}")
+                finally:
+                    progress.setValue(i)
+                    QApplication.processEvents()
+        finally:
+            progress.close()
+
+        if added:
+            first_idx = len(self._jobs)
+            self._jobs.extend(added)
+            self._refresh_job_table()
+            self._set_mode("jobs")
+            self._select_job_row(first_idx)
+
+        if skipped:
+            msg = f"Added {len(added)} job(s), skipped {len(skipped)} file(s)."
+            detail = "\n".join(skipped[:20])
+            if len(skipped) > 20:
+                detail += f"\n... and {len(skipped) - 20} more"
+            QMessageBox.warning(self, "Batch add completed with skipped files", f"{msg}\n\n{detail}")
+        else:
+            self.statusBar().showMessage(f"Batch added {len(added)} job(s).")
+
     def on_remove_selected_job(self):
         idx = self._selected_job_index()
         if idx is None:
             return
-        if self._jobs[idx].get("status") != "queued":
-            QMessageBox.information(self, "Cannot remove", "Only queued jobs can be removed.")
+        if self._jobs[idx].get("status") not in ("queued", "failed"):
+            QMessageBox.information(self, "Cannot remove", "Only queued or failed jobs can be removed.")
             return
         del self._jobs[idx]
         self._refresh_job_table()
@@ -2565,6 +2829,13 @@ class MainWindow(QMainWindow):
 
         self._cmb_model.setCurrentIndex(model_idx)
         self._apply_parameter_defaults(job.get("parameters", {}))
+        best_params = job.get("best_params")
+        if isinstance(best_params, dict) and best_params:
+            for name, value in best_params.items():
+                row = self._param_rows.get(name)
+                if row is not None:
+                    factor = self._get_unit_factor(name)
+                    row["spin"].setValue(float(value) / factor)
 
         exp = job.get("experiment", {})
         self.state.exp_t = np.array(exp.get("t"), dtype=float).copy()
@@ -2623,7 +2894,7 @@ class MainWindow(QMainWindow):
         self.state.best_fit_t = job.get("best_fit_t")
         self.state.best_fit_R = job.get("best_fit_R")
         self.state.best_fit_meta = job.get("best_fit_meta")
-        self._editing_job_index = idx if job.get("status") == "queued" else None
+        self._editing_job_index = idx if job.get("status") in ("queued", "failed") else None
         self._set_mode("fitting")
         self.btn_add_job.setText("Update job" if self._editing_job_index is not None else "Add to job list")
         self.statusBar().showMessage(f"Loaded job {idx + 1} to editor.")
@@ -2673,15 +2944,109 @@ class MainWindow(QMainWindow):
             job["bounds_si"],
             job["fit_flags"],
             job["scales"],
-            job["initial_values"],
+            job.get("_runtime_initial_values", job["initial_values"]),
             opt_config=OptConfig(**job["optimizer"]),
             parent=self,
         )
 
-    def _export_job_result(self, job: dict, res: FitResult, path: Path):
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, dict):
+            return {str(k): MainWindow._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [MainWindow._json_safe(v) for v in value]
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        return value
+
+    @staticmethod
+    def _mat_to_float(mat: dict, key: str, default=None):
+        if key not in mat:
+            return default
+        arr = np.asarray(mat[key])
+        if arr.size == 0:
+            return default
+        try:
+            return float(arr.reshape(-1)[0])
+        except Exception:
+            return default
+
+    @staticmethod
+    def _mat_to_string(mat: dict, key: str, default: str = "") -> str:
+        if key not in mat:
+            return default
+        val = mat[key]
+        if isinstance(val, str):
+            return val
+        arr = np.asarray(val)
+        if arr.size == 0:
+            return default
+        try:
+            first = arr.reshape(-1)[0]
+            if isinstance(first, bytes):
+                return first.decode(errors="replace")
+            return str(first)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _none_if_nan(value):
+        if value is None:
+            return None
+        try:
+            return None if np.isnan(float(value)) else value
+        except Exception:
+            return value
+
+    @staticmethod
+    def _mat_bytes(data: dict) -> bytes:
+        buf = BytesIO()
+        savemat(buf, data)
+        return buf.getvalue()
+
+    def _job_input_mat_dict(self, job: dict) -> dict:
+        exp = job.get("experiment", {})
+
+        def col(arr):
+            return np.asarray(arr, dtype=float).reshape(-1, 1)
+
+        return {
+            "t_exp": col(exp.get("t", [])),
+            "R_exp": col(exp.get("R", [])),
+            "P_inf": np.nan if exp.get("P_inf") is None else float(exp.get("P_inf")),
+            "rho": np.nan if exp.get("rho") is None else float(exp.get("rho")),
+            "R_eq": np.nan if exp.get("R_eq") is None else float(exp.get("R_eq")),
+            "source_path": str(exp.get("path", "")),
+            "file_name": str(exp.get("file_name", "")),
+        }
+
+    def _job_preview_mat_dict(self, job: dict) -> dict | None:
+        t = job.get("best_fit_t")
+        R = job.get("best_fit_R")
+        if t is None or R is None:
+            return None
+
+        def col(arr):
+            return np.asarray(arr, dtype=float).reshape(-1, 1)
+
+        meta = job.get("best_fit_meta") or {}
+        return {
+            "best_fit_t": col(t),
+            "best_fit_R": col(R),
+            "Rmax": float(meta.get("Rmax", np.nan)),
+            "t_rmax": float(meta.get("t_rmax", np.nan)),
+            "tc": float(meta.get("tc", np.nan)),
+            "LSQErr": np.nan if job.get("lsq_err") is None else float(job.get("lsq_err")),
+        }
+
+    def _build_job_result_export(self, job: dict, res: FitResult) -> dict | None:
         out = res.sim_out
         if out is None:
-            return
+            return None
 
         def col(arr):
             return np.asarray(arr, dtype=float).reshape(-1, 1)
@@ -2737,7 +3102,260 @@ class MainWindow(QMainWindow):
             arr[0, i]["group"] = np.array("", dtype=object)
         export["struct_best_fit"] = arr
 
+        return export
+
+    def _export_job_result(self, job: dict, res: FitResult, path: Path):
+        export = self._build_job_result_export(job, res)
+        if export is None:
+            return
         savemat(path, export)
+
+    def _job_result_mat_bytes(self, job: dict) -> bytes | None:
+        res = job.get("result")
+        if res is not None:
+            export = self._build_job_result_export(job, res)
+            if export is not None:
+                return self._mat_bytes(export)
+        archived = job.get("archived_result_mat")
+        if isinstance(archived, bytes):
+            return archived
+        return None
+
+    def _job_archive_meta(self, job: dict, row: int) -> dict:
+        exp = job.get("experiment", {})
+        status = job.get("status", "queued")
+        if status == "running":
+            status = "queued"
+        meta = {
+            "version": int(job.get("version", 1)),
+            "type": job.get("type", "fit"),
+            "status": status,
+            "created_at": job.get("created_at", ""),
+            "experiment": {
+                "path": exp.get("path", ""),
+                "file_name": exp.get("file_name", ""),
+                "P_inf": exp.get("P_inf"),
+                "rho": exp.get("rho"),
+                "R_eq": exp.get("R_eq"),
+            },
+            "model": job.get("model", ""),
+            "constants": job.get("constants", {}),
+            "parameters": job.get("parameters", {}),
+            "initial_values": job.get("initial_values", {}),
+            "fit_flags": job.get("fit_flags", {}),
+            "scales": job.get("scales", {}),
+            "bounds_si": job.get("bounds_si", {}),
+            "experiment_settings": job.get("experiment_settings", {}),
+            "fit_window": job.get("fit_window", {}),
+            "physics": job.get("physics", {}),
+            "optimizer": job.get("optimizer", {}),
+            "lsq_err": job.get("lsq_err"),
+            "best_params": job.get("best_params"),
+            "error": job.get("error"),
+            "export_path": job.get("export_path", ""),
+            "input_file": f"data/job_{row:03d}_input.mat",
+        }
+        preview = self._job_preview_mat_dict(job)
+        if preview is not None:
+            meta["preview_file"] = f"previews/job_{row:03d}_preview.mat"
+        if self._job_result_mat_bytes(job) is not None:
+            meta["result_file"] = f"results/job_{row:03d}_result.mat"
+        return self._json_safe(meta)
+
+    def on_export_job_queue(self):
+        if self._queue_running:
+            QMessageBox.warning(self, "Queue running", "Wait for the job queue to finish before exporting.")
+            return
+        if not self._jobs:
+            QMessageBox.information(self, "No jobs", "There are no jobs to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export job queue",
+            "",
+            "IMR job queue (*.imrqueue);;ZIP archive (*.zip)",
+        )
+        if not path:
+            return
+        out_path = Path(path)
+        if out_path.suffix.lower() not in (".imrqueue", ".zip"):
+            out_path = out_path.with_suffix(".imrqueue")
+
+        try:
+            queue_meta = {
+                "format": "IMR job queue",
+                "version": 1,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "jobs": [],
+            }
+            with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for row, job in enumerate(self._jobs, start=1):
+                    meta = self._job_archive_meta(job, row)
+                    queue_meta["jobs"].append(meta)
+                    zf.writestr(meta["input_file"], self._mat_bytes(self._job_input_mat_dict(job)))
+                    preview_file = meta.get("preview_file")
+                    preview = self._job_preview_mat_dict(job)
+                    if preview_file and preview is not None:
+                        zf.writestr(preview_file, self._mat_bytes(preview))
+                    result_file = meta.get("result_file")
+                    result_bytes = self._job_result_mat_bytes(job)
+                    if result_file and result_bytes is not None:
+                        zf.writestr(result_file, result_bytes)
+                zf.writestr(
+                    "queue.json",
+                    json.dumps(self._json_safe(queue_meta), indent=2, ensure_ascii=False),
+                )
+            self.statusBar().showMessage(f"Exported {len(self._jobs)} job(s) to {out_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", f"{e}\n\n{traceback.format_exc()}")
+
+    def _job_from_archive_meta(self, meta: dict, input_mat: dict, preview_mat: dict | None,
+                               result_bytes: bytes | None) -> dict:
+        exp_meta = meta.get("experiment", {})
+        t_exp = np.asarray(input_mat.get("t_exp", []), dtype=float).reshape(-1)
+        R_exp = np.asarray(input_mat.get("R_exp", []), dtype=float).reshape(-1)
+        p_inf = self._mat_to_float(input_mat, "P_inf", exp_meta.get("P_inf"))
+        rho = self._mat_to_float(input_mat, "rho", exp_meta.get("rho"))
+        r_eq = self._mat_to_float(input_mat, "R_eq", exp_meta.get("R_eq"))
+        p_inf = self._none_if_nan(p_inf)
+        rho = self._none_if_nan(rho)
+        r_eq = self._none_if_nan(r_eq)
+
+        status = meta.get("status", "queued")
+        if status not in ("queued", "completed", "failed"):
+            status = "queued"
+
+        bounds = meta.get("bounds_si", {}) or {}
+        bounds_si = {}
+        for key, value in bounds.items():
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                bounds_si[key] = (float(value[0]), float(value[1]))
+            else:
+                bounds_si[key] = (np.nan, np.nan)
+
+        job = {
+            "version": int(meta.get("version", 1)),
+            "type": meta.get("type", "fit"),
+            "status": status,
+            "created_at": meta.get("created_at", ""),
+            "experiment": {
+                "path": exp_meta.get("path") or self._mat_to_string(input_mat, "source_path", ""),
+                "file_name": exp_meta.get("file_name") or self._mat_to_string(input_mat, "file_name", "loaded experiment"),
+                "t": t_exp,
+                "R": R_exp,
+                "P_inf": p_inf,
+                "rho": rho,
+                "R_eq": r_eq,
+            },
+            "model": meta.get("model", ""),
+            "constants": dict(meta.get("constants", {}) or {}),
+            "parameters": dict(meta.get("parameters", {}) or {}),
+            "initial_values": dict(meta.get("initial_values", {}) or {}),
+            "fit_flags": dict(meta.get("fit_flags", {}) or {}),
+            "scales": dict(meta.get("scales", {}) or {}),
+            "bounds_si": bounds_si,
+            "experiment_settings": dict(meta.get("experiment_settings", {}) or {}),
+            "fit_window": dict(meta.get("fit_window", {}) or {}),
+            "physics": dict(meta.get("physics", {}) or {}),
+            "optimizer": dict(meta.get("optimizer", {}) or {}),
+            "result": None,
+            "lsq_err": meta.get("lsq_err"),
+            "best_params": meta.get("best_params"),
+            "error": meta.get("error"),
+            "export_path": meta.get("export_path", ""),
+        }
+
+        if preview_mat is not None:
+            job["best_fit_t"] = np.asarray(preview_mat.get("best_fit_t", []), dtype=float).reshape(-1)
+            job["best_fit_R"] = np.asarray(preview_mat.get("best_fit_R", []), dtype=float).reshape(-1)
+            job["best_fit_meta"] = {
+                "Rmax": self._mat_to_float(preview_mat, "Rmax", 1.0),
+                "t_rmax": self._mat_to_float(preview_mat, "t_rmax", 0.0),
+                "tc": self._mat_to_float(preview_mat, "tc", 1.0),
+            }
+        elif result_bytes is not None:
+            try:
+                result_mat = loadmat(BytesIO(result_bytes), squeeze_me=True, struct_as_record=False)
+                if "t_sim" in result_mat and "R_sim" in result_mat:
+                    job["best_fit_t"] = np.asarray(result_mat["t_sim"], dtype=float).reshape(-1)
+                    job["best_fit_R"] = np.asarray(result_mat["R_sim"], dtype=float).reshape(-1)
+                    job["best_fit_meta"] = {
+                        "Rmax": self._mat_to_float(result_mat, "Rmax_sim", 1.0),
+                        "t_rmax": 0.0,
+                        "tc": self._mat_to_float(result_mat, "tc", 1.0),
+                    }
+            except Exception:
+                pass
+
+        if result_bytes is not None:
+            job["archived_result_mat"] = result_bytes
+        return job
+
+    def on_import_job_queue(self):
+        if self._queue_running:
+            QMessageBox.warning(self, "Queue running", "Wait for the job queue to finish before importing.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import job queue",
+            "",
+            "IMR job queue (*.imrqueue *.zip);;All files (*.*)",
+        )
+        if not path:
+            return
+
+        try:
+            imported: list[dict] = []
+            with zipfile.ZipFile(path, "r") as zf:
+                queue_meta = json.loads(zf.read("queue.json").decode("utf-8"))
+                if int(queue_meta.get("version", 0)) != 1:
+                    raise ValueError("Unsupported job queue version.")
+                job_metas = list(queue_meta.get("jobs", []))
+                progress = QProgressDialog("Importing job queue...", "", 0, len(job_metas), self)
+                progress.setWindowTitle("Import job queue")
+                progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+                progress.setCancelButton(None)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                try:
+                    for i, meta in enumerate(job_metas, start=1):
+                        exp_meta = meta.get("experiment", {})
+                        label = exp_meta.get("file_name") or f"job {i}"
+                        progress.setLabelText(f"Importing {i}/{len(job_metas)}: {label}")
+                        progress.setValue(i - 1)
+                        QApplication.processEvents()
+                        input_file = meta.get("input_file")
+                        if not input_file:
+                            raise ValueError("Job is missing its input MAT file.")
+                        input_mat = loadmat(BytesIO(zf.read(input_file)), squeeze_me=True, struct_as_record=False)
+                        preview_mat = None
+                        preview_file = meta.get("preview_file")
+                        if preview_file:
+                            preview_mat = loadmat(BytesIO(zf.read(preview_file)), squeeze_me=True, struct_as_record=False)
+                        result_bytes = None
+                        result_file = meta.get("result_file")
+                        if result_file:
+                            result_bytes = zf.read(result_file)
+                        imported.append(self._job_from_archive_meta(meta, input_mat, preview_mat, result_bytes))
+                        progress.setValue(i)
+                        QApplication.processEvents()
+                finally:
+                    progress.close()
+
+            if not imported:
+                QMessageBox.information(self, "No jobs", "The selected archive does not contain any jobs.")
+                return
+
+            first_idx = len(self._jobs)
+            self._jobs.extend(imported)
+            self._refresh_job_table()
+            self._set_mode("jobs")
+            self._select_job_row(first_idx)
+            self.statusBar().showMessage(f"Imported {len(imported)} job(s) from {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", f"{e}\n\n{traceback.format_exc()}")
 
     def on_run_queue(self):
         if self._queue_running:
@@ -2749,20 +3367,33 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Simulation in progress", "Wait for the current simulation to finish first.")
             return
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder for queue results")
-        if not out_dir:
-            return
+        out_dir = self._job_output_dir.strip()
+        if self._job_ask_output_dir or not out_dir or not Path(out_dir).is_dir():
+            out_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select output folder for queue results",
+                out_dir if out_dir and Path(out_dir).exists() else "",
+            )
+            if not out_dir:
+                return
+            self._job_output_dir = out_dir
+            self._save_settings()
 
         self._queue_output_dir = Path(out_dir)
         self._queue_running = True
         self._queue_stop_after_current = False
+        self._queue_previous_seed = None
         self._start_next_queue_job()
 
     def on_stop_queue_after_current(self):
         if self._queue_running:
             self._queue_stop_after_current = True
             self.btn_stop_jobs.setEnabled(False)
-            self.statusBar().showMessage("Queue will stop after the current job.")
+            if self._queue_fit_worker is not None and self._queue_fit_worker.isRunning():
+                self._queue_fit_worker.request_stop()
+                self.statusBar().showMessage("Stopping current queue job...")
+            else:
+                self.statusBar().showMessage("Queue will stop after the current job.")
 
     def _start_next_queue_job(self):
         if self._queue_stop_after_current:
@@ -2783,6 +3414,7 @@ class MainWindow(QMainWindow):
         job = self._jobs[next_idx]
         job["status"] = "running"
         job["error"] = None
+        job.pop("_runtime_initial_values", None)
         self._refresh_job_table()
         self.tbl_jobs.selectRow(next_idx)
 
@@ -2796,6 +3428,7 @@ class MainWindow(QMainWindow):
             f"Running queue job {next_idx + 1}/{len(self._jobs)}: "
             f"{job['experiment']['file_name']}"
         )
+        self._prepare_chained_initial_values(job, next_idx)
         self._redraw_all()
 
         self._queue_fit_worker = self._make_job_fit_worker(job)
@@ -2805,11 +3438,62 @@ class MainWindow(QMainWindow):
         self._queue_fit_worker.start()
         self._update_job_buttons()
 
+    def _prepare_chained_initial_values(self, job: dict, idx: int):
+        if not self._job_chain_best_fit_initial:
+            return
+        seed = self._queue_previous_seed
+        if not isinstance(seed, dict):
+            return
+        if seed.get("type") != job.get("type") or seed.get("model") != job.get("model"):
+            self.lbl_output.appendPlainText(
+                "Previous best-fit seed skipped: job type or model differs from current job."
+            )
+            return
+        prev_params = seed.get("best_params")
+        if not isinstance(prev_params, dict) or not prev_params:
+            return
+
+        initial = dict(job.get("initial_values", {}))
+        used = []
+        for name, value in prev_params.items():
+            if name in initial:
+                try:
+                    initial[name] = float(value)
+                    used.append(name)
+                except Exception:
+                    pass
+        if not used:
+            return
+
+        job["_runtime_initial_values"] = initial
+        job["chained_initial_from_job"] = int(seed.get("index", -1)) + 1
+        self.lbl_output.appendPlainText(
+            f"Seeded initial values from job {int(seed.get('index', -1)) + 1}: "
+            f"{', '.join(used)}"
+        )
+
+    def _remember_queue_seed_from_job(self, idx: int):
+        if not self._job_chain_best_fit_initial:
+            return
+        if idx is None or not (0 <= idx < len(self._jobs)):
+            return
+        job = self._jobs[idx]
+        best_params = job.get("best_params")
+        if not isinstance(best_params, dict) or not best_params:
+            return
+        self._queue_previous_seed = {
+            "index": idx,
+            "type": job.get("type"),
+            "model": job.get("model"),
+            "best_params": dict(best_params),
+        }
+
     def _finish_queue(self, message: str):
         self._queue_running = False
         self._queue_stop_after_current = False
         self._queue_current_index = None
         self._queue_fit_worker = None
+        self._queue_previous_seed = None
         self._update_job_buttons()
         self.statusBar().showMessage(message)
 
@@ -2846,8 +3530,17 @@ class MainWindow(QMainWindow):
         if idx is None:
             return
         job = self._jobs[idx]
-        job["status"] = "completed"
         job["lsq_err"] = float(res.lsq_err)
+        threshold_enabled = bool(self._job_success_threshold_enabled)
+        threshold_value = float(self._job_success_lsqerr)
+        if threshold_enabled and float(res.lsq_err) > threshold_value:
+            job["status"] = "failed"
+            job["error"] = (
+                f"Final LSQErr {res.lsq_err:.6g} exceeds success threshold "
+                f"{threshold_value:.6g}."
+            )
+        else:
+            job["status"] = "completed"
         job["result"] = res
         job["best_params"] = dict(res.best_params)
         if res.t_sim is not None and res.R_sim is not None:
@@ -2873,6 +3566,7 @@ class MainWindow(QMainWindow):
         if self._queue_fit_worker is not None:
             self._queue_fit_worker.wait(5000)
         self._queue_fit_worker = None
+        self._remember_queue_seed_from_job(idx)
         self._refresh_job_table()
         QTimer.singleShot(0, self._start_next_queue_job)
 
@@ -2886,6 +3580,7 @@ class MainWindow(QMainWindow):
         if self._queue_fit_worker is not None:
             self._queue_fit_worker.wait(5000)
         self._queue_fit_worker = None
+        self._remember_queue_seed_from_job(idx)
         self._refresh_job_table()
         QTimer.singleShot(0, self._start_next_queue_job)
 
