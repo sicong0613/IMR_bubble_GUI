@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from importlib.resources import files
-from typing import List
+from pathlib import Path
+import sys
+from typing import Callable, List
 
 
 @dataclass(frozen=True)
@@ -31,11 +33,10 @@ class ConstitutiveModel:
     description: str
     parameters: List[ConstitutiveParameter]
     constants: dict  # non-fittable physics constants from JSON
+    solver_entrypoint: str | None = None  # "module:function" for user plugins
 
 
-def _load_model_json(filename: str) -> ConstitutiveModel:
-    """Load a constitutive model from a JSON file in this package."""
-    data = json.loads(files(__package__).joinpath(filename).read_text(encoding="utf-8"))
+def _model_from_json_data(data: dict) -> ConstitutiveModel:
     params: List[ConstitutiveParameter] = []
     for p in data.get("parameters", []):
         units_raw = p.get("units")
@@ -75,7 +76,19 @@ def _load_model_json(filename: str) -> ConstitutiveModel:
         description=data.get("description", ""),
         parameters=params,
         constants=constants,
+        solver_entrypoint=data.get("solver_entrypoint"),
     )
+
+
+def _load_model_json(filename: str) -> ConstitutiveModel:
+    """Load a constitutive model from a JSON file in this package."""
+    data = json.loads(files(__package__).joinpath(filename).read_text(encoding="utf-8"))
+    return _model_from_json_data(data)
+
+
+def _load_model_json_path(path: Path) -> ConstitutiveModel:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return _model_from_json_data(data)
 
 
 def load_nhkv_model() -> ConstitutiveModel:
@@ -94,7 +107,7 @@ def load_gmod2_model() -> ConstitutiveModel:
     return _load_model_json("gmod.json")
 
 
-AVAILABLE_MODELS = {
+BUILTIN_MODELS = {
     "NHKV": load_nhkv_model,
     "NHKV (Rmax)": load_nhkv_rmax_model,
     "GMOD1": load_gmod1_model,
@@ -102,9 +115,56 @@ AVAILABLE_MODELS = {
 }
 
 
+def _candidate_user_model_dirs() -> list[Path]:
+    roots = [
+        Path.cwd() / "user_models",
+        Path(__file__).resolve().parents[2] / "user_models",
+    ]
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            resolved = root
+        if resolved not in seen:
+            out.append(root)
+            seen.add(resolved)
+    return out
+
+
+def discover_user_models() -> dict[str, Callable[[], ConstitutiveModel]]:
+    models: dict[str, Callable[[], ConstitutiveModel]] = {}
+    for root in _candidate_user_model_dirs():
+        if not root.is_dir():
+            continue
+        root_str = str(root.resolve())
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        for path in sorted(root.glob("*.json")):
+            try:
+                model = _load_model_json_path(path)
+            except Exception:
+                continue
+            if not model.id or not model.solver_entrypoint:
+                continue
+            models[model.id] = (lambda p=path: _load_model_json_path(p))
+    return models
+
+
+def load_available_models() -> dict[str, Callable[[], ConstitutiveModel]]:
+    models = dict(BUILTIN_MODELS)
+    models.update(discover_user_models())
+    return models
+
+
+AVAILABLE_MODELS = load_available_models()
+
+
 __all__ = [
     "UnitOption", "ConstitutiveParameter", "ConstitutiveModel",
     "load_nhkv_model", "load_nhkv_rmax_model",
-    "load_gmod1_model", "load_gmod2_model", "AVAILABLE_MODELS",
+    "load_gmod1_model", "load_gmod2_model",
+    "BUILTIN_MODELS", "AVAILABLE_MODELS", "discover_user_models", "load_available_models",
 ]
 

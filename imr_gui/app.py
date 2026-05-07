@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import json
 import sys
 import traceback
@@ -34,8 +35,10 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHeaderView,
+    QSizePolicy,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -69,7 +72,7 @@ from imr_gui.io import load_experiment_mat, find_rmax_value
 from imr_gui.ui.mpl_canvas import MplCanvas
 from imr_gui.constitutive import (
     load_nhkv_model,
-    ConstitutiveParameter, ConstitutiveModel, AVAILABLE_MODELS,
+    ConstitutiveParameter, ConstitutiveModel, load_available_models,
 )
 from imr_gui.opt import (
     OptConfig, FitConfig, FitProgress, FitResult,
@@ -240,6 +243,14 @@ class _SimSpec:
     solver: dict
     Rmax_exp: float = 0.0  # used only by NHKV (Rmax); 0 means fall back to Req
     bubble_model: str = "Keller-Miksis"
+    plugin_entrypoint: str = ""
+    plugin_context: dict | None = None
+
+
+@dataclass
+class _PluginSimSpec:
+    entrypoint: str
+    context: dict
 
 
 def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
@@ -277,7 +288,7 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             Req=spec.Req, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
-    else:  # GMOD2
+    elif key == "GMOD2":
         const_kw = {k: v for k, v in spec.const.items()
                     if k in GMODInputs.__dataclass_fields__}
         return simulate_gmod_lic(GMODInputs(
@@ -295,6 +306,49 @@ def _sim_spec_call(spec: _SimSpec, params_si: dict, tspan: float):
             Req=spec.Req, tspan=tspan, NT=spec.NT,
             P_inf=spec.P_inf, rho=spec.rho, bubble_model=bm, **spec.solver, **const_kw,
         ))
+    if spec.plugin_entrypoint:
+        ctx = dict(spec.plugin_context or {})
+        ctx.update({
+            "Req": spec.Req,
+            "NT": spec.NT,
+            "P_inf": spec.P_inf,
+            "rho": spec.rho,
+            "gamma": float(spec.const.get("gamma", 0.056)),
+            "c_long": float(spec.const.get("c_long", 1485.0)),
+            "bubble_model": bm,
+            "constants": dict(spec.const),
+            "solver": dict(spec.solver),
+            "Rmax_exp": spec.Rmax_exp,
+            "model_key": key,
+        })
+        return _plugin_sim_call(_PluginSimSpec(spec.plugin_entrypoint, ctx), params_si, tspan)
+    raise ValueError(f"No solver is registered for model '{key}'.")
+
+
+def _load_entrypoint(entrypoint: str):
+    if ":" not in entrypoint:
+        raise ValueError("solver_entrypoint must have the form 'module:function'.")
+    module_name, func_name = entrypoint.split(":", 1)
+    module = importlib.import_module(module_name)
+    fn = getattr(module, func_name)
+    if not callable(fn):
+        raise TypeError(f"Solver entrypoint is not callable: {entrypoint}")
+    return fn
+
+
+def _plugin_sim_call(spec: _PluginSimSpec, params_si: dict, tspan: float):
+    fn = _load_entrypoint(spec.entrypoint)
+    context = dict(spec.context)
+    context["tspan"] = float(tspan)
+    return fn(dict(params_si), float(tspan), context)
+
+
+def _run_plugin_simulation(inp: dict):
+    return _plugin_sim_call(
+        _PluginSimSpec(inp["solver_entrypoint"], inp["context"]),
+        inp["params_si"],
+        float(inp["tspan"]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +457,7 @@ class MainWindow(QMainWindow):
         self._saved_ui_defaults: dict = {}
         self._jobs: list[dict] = []
         self._editing_job_index: int | None = None
+        self._available_models = load_available_models()
 
         self._build_menu()
         self._build_ui()
@@ -497,7 +552,7 @@ class MainWindow(QMainWindow):
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("Model:"))
         self._cmb_model = _NoWheelComboBox()
-        for key in AVAILABLE_MODELS:
+        for key in self._available_models:
             self._cmb_model.addItem(key)
         self._cmb_model.setCurrentText("NHKV")
         model_row.addWidget(self._cmb_model, stretch=1)
@@ -790,6 +845,14 @@ class MainWindow(QMainWindow):
         self.spin_c_long.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.spin_c_long.setToolTip("Longitudinal speed of sound in liquid (m/s)")
 
+        self.spin_gamma = _NoWheelSpinBox()
+        self.spin_gamma.setRange(0.0, 10.0)
+        self.spin_gamma.setDecimals(6)
+        self.spin_gamma.setSingleStep(0.001)
+        self.spin_gamma.setValue(0.056)
+        self.spin_gamma.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_gamma.setToolTip("Liquid surface tension (N/m)")
+
         self.spin_NT = _NoWheelSpinBox()
         self.spin_NT.setRange(50, 2000)
         self.spin_NT.setDecimals(0)
@@ -821,6 +884,7 @@ class MainWindow(QMainWindow):
             dlg.setWindowTitle("Physics Settings")
             dlg.setMinimumWidth(360)
             lay = QVBoxLayout(dlg)
+            lay.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
 
             warn_lbl = QLabel(
                 "⚠  Warning: do not modify unless you know what you are doing!"
@@ -830,12 +894,14 @@ class MainWindow(QMainWindow):
                 "border: 1px solid #cc6600; border-radius: 3px; }"
             )
             warn_lbl.setWordWrap(True)
+            warn_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             lay.addWidget(warn_lbl)
 
             form = QFormLayout()
             form.addRow("P_inf (Pa):", self.spin_P_inf)
             form.addRow("rho (kg/m³):", self.spin_rho)
             form.addRow("c_long (m/s):", self.spin_c_long)
+            form.addRow("gamma (N/m):", self.spin_gamma)
             form.addRow("NT (grid):", self.spin_NT)
             lay.addLayout(form)
 
@@ -865,6 +931,7 @@ class MainWindow(QMainWindow):
 
             self._physics_dlg = dlg
 
+        self._toggle_advanced_solver(self._adv_toggle.isChecked())
         self._physics_dlg.exec()
 
     def _toggle_advanced_solver(self, checked: bool):
@@ -873,6 +940,9 @@ class MainWindow(QMainWindow):
             "▾ Advanced Solver Settings" if checked
             else "▸ Advanced Solver Settings"
         )
+        if hasattr(self, "_physics_dlg"):
+            self._physics_dlg.layout().activate()
+            self._physics_dlg.adjustSize()
 
     # =====================================================================
     # Optimizer Settings dialog
@@ -1352,7 +1422,7 @@ class MainWindow(QMainWindow):
             models = dict(models)
 
         # Backwards compatibility with the first single-model settings schema.
-        if "parameters" in ui and ui.get("model") in AVAILABLE_MODELS:
+        if "parameters" in ui and ui.get("model") in load_available_models():
             model_key = ui["model"]
             old_model = dict(models.get(model_key, {}))
             old_model["parameters"] = ui.get("parameters", {})
@@ -1388,6 +1458,7 @@ class MainWindow(QMainWindow):
                 "P_inf":   float(self.spin_P_inf.value()),
                 "rho":     float(self.spin_rho.value()),
                 "c_long":  float(self.spin_c_long.value()),
+                "gamma":   float(self.spin_gamma.value()),
                 "NT":      int(self.spin_NT.value()),
                 "solver":  self._cmb_solver.currentText(),
                 "rtol":    self.le_rtol.text(),
@@ -1464,7 +1535,7 @@ class MainWindow(QMainWindow):
         ui = self._normalise_ui_defaults(data.get("ui", {}))
         self._saved_ui_defaults = ui
         model_key = ui.get("active_model")
-        if model_key in AVAILABLE_MODELS:
+        if model_key in self._available_models:
             idx = self._cmb_model.findText(model_key)
             if idx >= 0:
                 self._cmb_model.setCurrentIndex(idx)
@@ -1478,6 +1549,7 @@ class MainWindow(QMainWindow):
         if "P_inf"  in phys: self.spin_P_inf.setValue(float(phys["P_inf"]))
         if "rho"    in phys: self.spin_rho.setValue(float(phys["rho"]))
         if "c_long" in phys: self.spin_c_long.setValue(float(phys["c_long"]))
+        if "gamma"  in phys: self.spin_gamma.setValue(float(phys["gamma"]))
         if "NT"     in phys: self.spin_NT.setValue(int(phys["NT"]))
         if "solver" in phys:
             idx = self._cmb_solver.findText(phys["solver"])
@@ -1545,7 +1617,7 @@ class MainWindow(QMainWindow):
     # =====================================================================
 
     def _on_model_changed(self, model_key: str):
-        loader = AVAILABLE_MODELS.get(model_key)
+        loader = self._available_models.get(model_key)
         if not loader:
             return
         model = loader()
@@ -1729,7 +1801,7 @@ class MainWindow(QMainWindow):
             fw["row_widget"].setEnabled(is_fitting)
             fw["cmb_scale"].setEnabled(is_fitting)
 
-        self._fit_window_widget.setVisible(is_fitting)
+        self._fit_window_widget.setVisible(not is_jobs)
         if hasattr(self, "_left_stack"):
             self._left_stack.setCurrentIndex(1 if is_jobs else 0)
         self.btn_primary_action.setText("Fit" if is_fitting else "Simulate")
@@ -1809,6 +1881,22 @@ class MainWindow(QMainWindow):
 
     # --- build model-specific inputs ---
 
+    def _get_model_definition(self, model_key: str | None = None) -> ConstitutiveModel | None:
+        key = model_key or self._get_active_model_key()
+        if self._current_model is not None and self._current_model.id == key:
+            return self._current_model
+        loader = self._available_models.get(key)
+        if loader is None:
+            return None
+        try:
+            return loader()
+        except Exception:
+            return None
+
+    def _plugin_entrypoint_for_model(self, model_key: str | None = None) -> str:
+        model = self._get_model_definition(model_key)
+        return str(model.solver_entrypoint or "") if model is not None else ""
+
     def _get_solver_settings(self) -> dict:
         try:
             rtol = float(self.le_rtol.text())
@@ -1824,11 +1912,38 @@ class MainWindow(QMainWindow):
             abs_tol=atol,
         )
 
+    def _plugin_context(
+        self,
+        *,
+        model_key: str,
+        Req: float,
+        NT: int,
+        P_inf: float,
+        rho: float,
+        const: dict,
+        solver: dict,
+        Rmax_exp: float = 0.0,
+    ) -> dict:
+        return {
+            "model_key": model_key,
+            "Req": float(Req),
+            "NT": int(NT),
+            "P_inf": float(P_inf),
+            "rho": float(rho),
+            "gamma": float(self.spin_gamma.value()),
+            "c_long": float(self.spin_c_long.value()),
+            "bubble_model": self._bubble_model,
+            "constants": dict(const),
+            "solver": dict(solver),
+            "Rmax_exp": float(Rmax_exp),
+        }
+
     def _build_sim_inputs(self, params: dict[str, float]):
         """Build solver inputs from GUI params + constants for the current model."""
         key = self._get_active_model_key()
         const = dict(self._model_constants)
         const["c_long"] = float(self.spin_c_long.value())
+        const["gamma"] = float(self.spin_gamma.value())
         Req = float(self.spin_Req_um.value()) * 1e-6
         tspan = float(self.spin_tspan_us.value()) * 1e-6
         NT = int(self.spin_NT.value())
@@ -1837,6 +1952,22 @@ class MainWindow(QMainWindow):
         rho = float(self.spin_rho.value())
 
         bm = self._bubble_model
+        plugin_entrypoint = self._plugin_entrypoint_for_model(key)
+        if plugin_entrypoint:
+            Rmax_exp = (
+                find_rmax_value(self.state.exp_t, self.state.exp_R)
+                if self.state.exp_t is not None and self.state.exp_R is not None
+                else 0.0
+            )
+            return {
+                "solver_entrypoint": plugin_entrypoint,
+                "params_si": dict(params),
+                "tspan": tspan,
+                "context": self._plugin_context(
+                    model_key=key, Req=Req, NT=NT, P_inf=P_inf, rho=rho,
+                    const=const, solver=solver, Rmax_exp=Rmax_exp,
+                ),
+            }
         if key == "NHKV":
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvInputs.__dataclass_fields__}
@@ -1893,6 +2024,8 @@ class MainWindow(QMainWindow):
 
     def _get_simulate_fn(self):
         key = self._get_active_model_key()
+        if self._plugin_entrypoint_for_model(key):
+            return _run_plugin_simulation
         if key == "NHKV":
             return simulate_nhkv_lic
         if key == "NHKV (Rmax)":
@@ -1906,6 +2039,7 @@ class MainWindow(QMainWindow):
         key = self._get_active_model_key()
         const = dict(self._model_constants)
         const["c_long"] = float(self.spin_c_long.value())
+        const["gamma"] = float(self.spin_gamma.value())
         Req = float(self.spin_Req_um.value()) * 1e-6
         NT = int(self.spin_NT.value())
         solver = self._get_solver_settings()
@@ -1913,6 +2047,18 @@ class MainWindow(QMainWindow):
         rho = float(self.spin_rho.value())
 
         bm = self._bubble_model
+        plugin_entrypoint = self._plugin_entrypoint_for_model(key)
+        if plugin_entrypoint:
+            Rmax_exp = (
+                find_rmax_value(self.state.exp_t, self.state.exp_R)
+                if self.state.exp_t is not None and self.state.exp_R is not None
+                else 0.0
+            )
+            ctx = self._plugin_context(
+                model_key=key, Req=Req, NT=NT, P_inf=P_inf, rho=rho,
+                const=const, solver=solver, Rmax_exp=Rmax_exp,
+            )
+            return _plugin_sim_call(_PluginSimSpec(plugin_entrypoint, ctx), params_si, tspan)
         if key == "NHKV":
             const_kw = {k: v for k, v in const.items()
                         if k in NhkvInputs.__dataclass_fields__}
@@ -2037,7 +2183,7 @@ class MainWindow(QMainWindow):
         self._redraw_all()
 
     def _on_fit_window_changed(self):
-        if self.state.mode == "fitting":
+        if self.state.mode in ("simulation", "fitting"):
             self._redraw_all()
 
     def _fit_window_cycle_indices(self, cycles: int) -> tuple[int, int, int]:
@@ -2116,7 +2262,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Only {found} collapse cycle(s) found; fit window uses the last one found."
             )
-        if self.state.mode == "fitting":
+        if self.state.mode in ("simulation", "fitting"):
             self._redraw_all()
 
     def _on_fit_window_auto_changed(self, checked: bool):
@@ -2124,7 +2270,7 @@ class MainWindow(QMainWindow):
         self.spin_t_fit_end.setEnabled(not checked)
         if checked:
             self._apply_fit_window_cycles()
-        elif self.state.mode == "fitting":
+        elif self.state.mode in ("simulation", "fitting"):
             self._redraw_all()
 
     def _on_fit_window_cycles_changed(self, _value: int):
@@ -2251,7 +2397,7 @@ class MainWindow(QMainWindow):
                     R_plot = best_fit_R
             self.canvas.plot_fit_best(t_plot, R_plot)
 
-        if self.state.mode == "fitting" and self.state.exp_t is not None:
+        if self.state.mode in ("simulation", "fitting") and self.state.exp_t is not None:
             t0_view = self._time_s_to_view(
                 float(self.spin_t_fit_start.value()) * 1e-6
             )
@@ -2480,6 +2626,41 @@ class MainWindow(QMainWindow):
         )
         self.btn_stop_jobs.setEnabled(self._queue_running and not self._queue_stop_after_current)
 
+    def _confirm_initial_values_within_bounds(
+        self,
+        initial_values: dict[str, float],
+        bounds_si: dict[str, tuple[float, float]],
+        fit_flags: dict[str, bool],
+    ) -> bool:
+        rows: list[str] = []
+        for name, enabled in fit_flags.items():
+            if not enabled or name not in initial_values or name not in bounds_si:
+                continue
+            value = float(initial_values[name])
+            lb, ub = bounds_si[name]
+            lb = float(lb)
+            ub = float(ub)
+            if lb > ub:
+                lb, ub = ub, lb
+            if value < lb or value > ub:
+                rows.append(
+                    f"{name}: current={value:.6g}, bounds=[{lb:.6g}, {ub:.6g}]"
+                )
+
+        if not rows:
+            return True
+
+        reply = QMessageBox.question(
+            self,
+            "Initial value outside bounds",
+            "Some fitted parameters start outside their bounds:\n\n"
+            + "\n".join(rows)
+            + "\n\nContinue anyway? The optimizer will start from the nearest bound.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def _build_fit_job_snapshot_from_data(
         self,
         *,
@@ -2536,6 +2717,7 @@ class MainWindow(QMainWindow):
                 "R_eq": exp_R_eq,
             },
             "model": model_key,
+            "solver_entrypoint": self._plugin_entrypoint_for_model(model_key),
             "constants": dict(self._model_constants),
             "parameters": self._collect_parameter_defaults(),
             "initial_values": self._get_param_si(),
@@ -2558,6 +2740,7 @@ class MainWindow(QMainWindow):
                 "P_inf": float(self.spin_P_inf.value()),
                 "rho": float(self.spin_rho.value()),
                 "c_long": float(self.spin_c_long.value()),
+                "gamma": float(self.spin_gamma.value()),
                 "NT": int(self.spin_NT.value()),
                 **self._get_solver_settings(),
             },
@@ -2588,6 +2771,12 @@ class MainWindow(QMainWindow):
                 self, "No parameters selected",
                 "Enable the Fit checkbox for at least one parameter.",
             )
+            return None
+
+        initial_values = self._get_param_si()
+        if not self._confirm_initial_values_within_bounds(
+            initial_values, bounds_si, fit_flags
+        ):
             return None
 
         if self.chk_fit_window_cycles.isChecked():
@@ -2871,6 +3060,8 @@ class MainWindow(QMainWindow):
             self.spin_rho.setValue(float(phys["rho"]))
         if phys.get("c_long") is not None:
             self.spin_c_long.setValue(float(phys["c_long"]))
+        if phys.get("gamma") is not None:
+            self.spin_gamma.setValue(float(phys["gamma"]))
         if phys.get("NT") is not None:
             self.spin_NT.setValue(int(phys["NT"]))
         if phys.get("solver_method"):
@@ -2917,20 +3108,38 @@ class MainWindow(QMainWindow):
         phys = job["physics"]
         exp_settings = job["experiment_settings"]
         rmax_exp = find_rmax_value(t_exp_all, R_exp_all)
+        job_const = dict(job.get("constants", {}))
+        job_const["c_long"] = float(phys.get("c_long", job_const.get("c_long", 1485.0)))
+        job_const["gamma"] = float(phys.get("gamma", job_const.get("gamma", 0.056)))
+        job_solver = {
+            "solver_method": phys.get("solver_method", "BDF"),
+            "rel_tol": float(phys.get("rel_tol", 1e-8)),
+            "abs_tol": float(phys.get("abs_tol", 1e-7)),
+        }
         sim_spec = _SimSpec(
             model_key=job["model"],
             Req=float(exp_settings["Req_um"]) * 1e-6,
             NT=int(phys["NT"]),
             P_inf=float(phys["P_inf"]),
             rho=float(phys["rho"]),
-            const=dict(job.get("constants", {})),
-            solver={
-                "solver_method": phys.get("solver_method", "BDF"),
-                "rel_tol": float(phys.get("rel_tol", 1e-8)),
-                "abs_tol": float(phys.get("abs_tol", 1e-7)),
-            },
+            const=job_const,
+            solver=job_solver,
             Rmax_exp=float(rmax_exp),
             bubble_model=phys.get("bubble_model", "Keller-Miksis"),
+            plugin_entrypoint=str(job.get("solver_entrypoint", "")),
+            plugin_context={
+                "model_key": job["model"],
+                "Req": float(exp_settings["Req_um"]) * 1e-6,
+                "NT": int(phys["NT"]),
+                "P_inf": float(phys["P_inf"]),
+                "rho": float(phys["rho"]),
+                "bubble_model": phys.get("bubble_model", "Keller-Miksis"),
+                "c_long": float(job_const.get("c_long", 1485.0)),
+                "gamma": float(job_const.get("gamma", 0.056)),
+                "constants": job_const,
+                "solver": job_solver,
+                "Rmax_exp": float(rmax_exp),
+            },
         )
         cfg = FitConfig(
             t_exp=t_windowed,
@@ -3081,6 +3290,7 @@ class MainWindow(QMainWindow):
             "Rmax_exp": float(Rmax_exp),
             "P_inf": P_inf,
             "rho": rho,
+            "gamma": float(phys.get("gamma", np.nan)),
             "Req": Req,
             "model_key": job["model"],
             "LSQErr": float(res.lsq_err),
@@ -3139,6 +3349,7 @@ class MainWindow(QMainWindow):
                 "R_eq": exp.get("R_eq"),
             },
             "model": job.get("model", ""),
+            "solver_entrypoint": job.get("solver_entrypoint", ""),
             "constants": job.get("constants", {}),
             "parameters": job.get("parameters", {}),
             "initial_values": job.get("initial_values", {}),
@@ -3249,6 +3460,7 @@ class MainWindow(QMainWindow):
                 "R_eq": r_eq,
             },
             "model": meta.get("model", ""),
+            "solver_entrypoint": meta.get("solver_entrypoint", ""),
             "constants": dict(meta.get("constants", {}) or {}),
             "parameters": dict(meta.get("parameters", {}) or {}),
             "initial_values": dict(meta.get("initial_values", {}) or {}),
@@ -3611,6 +3823,9 @@ class MainWindow(QMainWindow):
         bubble_model = self._bubble_model
         self.statusBar().showMessage(f"Simulating {model_key} ({bubble_model}, LIC)...")
 
+        if self.chk_fit_window_cycles.isChecked() and self.state.exp_t is not None:
+            self._apply_fit_window_cycles()
+
         params = self._get_param_si()
         inp = self._build_sim_inputs(params)
         sim_fn = self._get_simulate_fn()
@@ -3661,10 +3876,23 @@ class MainWindow(QMainWindow):
             _p = f"P_inf={used_pinf:.1f} Pa"
             _rh = f"rho={used_rho:.1f} kg/m³"
             _rq = f"Req={float(self.spin_Req_um.value()):.3f} µm"
-            self.lbl_output.setPlainText(
-                f"{_hdr}  {_r:<{_C}}| {_t:<{_C}}| {_u}\n"
-                f"{_ind}  {_p:<{_C}}| {_rh:<{_C}}| {_rq}"
-            )
+            lines = [
+                f"{_hdr}  {_r:<{_C}}| {_t:<{_C}}| {_u}",
+                f"{_ind}  {_p:<{_C}}| {_rh:<{_C}}| {_rq}",
+            ]
+            lsq_err, n_lsq, lsq_msg = self._simulation_window_lsqerr(out)
+            if lsq_err is not None:
+                t0_us = float(self.spin_t_fit_start.value())
+                t1_us = float(self.spin_t_fit_end.value())
+                if t0_us > t1_us:
+                    t0_us, t1_us = t1_us, t0_us
+                lines.append(
+                    f"{_ind}  LSQErr={lsq_err:.4e} over {n_lsq} point(s) "
+                    f"[{t0_us:.3f}, {t1_us:.3f}] us"
+                )
+            elif lsq_msg:
+                lines.append(f"{_ind}  LSQErr not computed: {lsq_msg}")
+            self.lbl_output.setPlainText("\n".join(lines))
             self.statusBar().showMessage("Simulation completed")
 
         def _on_fail(msg: str, tb: str):
@@ -3697,6 +3925,43 @@ class MainWindow(QMainWindow):
         if eta is not None:
             msg += f"  |  ETA {self._sec_to_hms(eta)}"
         self._sim_dialog.setLabelText(msg)
+
+    def _simulation_window_lsqerr(self, out: NhkvOutputs) -> tuple[float | None, int, str | None]:
+        """Compute the same windowed LSQErr used by fitting for a simulation."""
+        if self.state.exp_t is None or self.state.exp_R is None:
+            return None, 0, None
+        if out.t_sim is None or out.R_sim is None or out.t_sim.size < 3 or out.R_sim.size < 3:
+            return None, 0, "simulation output contains fewer than 3 points"
+
+        t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
+        t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
+        if t_start_s > t_end_s:
+            t_start_s, t_end_s = t_end_s, t_start_s
+
+        t_exp = np.asarray(self.state.exp_t, dtype=float)
+        R_exp = np.asarray(self.state.exp_R, dtype=float)
+        mask = (t_exp >= t_start_s) & (t_exp <= t_end_s)
+        t_windowed = t_exp[mask]
+        R_windowed = R_exp[mask]
+        n_points = int(t_windowed.size)
+        if n_points < 3:
+            return None, n_points, "simulation LSQErr window contains fewer than 3 points"
+
+        try:
+            R_sim_interp = np.interp(
+                t_windowed,
+                np.asarray(out.t_sim, dtype=float),
+                np.asarray(out.R_sim, dtype=float),
+                left=float(out.R_sim[0]),
+                right=float(out.R_sim[-1]),
+            )
+        except Exception as exc:
+            return None, n_points, f"simulation LSQErr interpolation failed: {exc}"
+
+        err = float(np.sum(((R_windowed - R_sim_interp) * 1e6) ** 2) / max(n_points, 1))
+        if not np.isfinite(err):
+            return None, n_points, "simulation LSQErr is not finite"
+        return err, n_points, None
 
     # =====================================================================
     # fitting
@@ -3738,6 +4003,10 @@ class MainWindow(QMainWindow):
             return
 
         initial_values = self._get_param_si()
+        if not self._confirm_initial_values_within_bounds(
+            initial_values, bounds_si, fit_flags
+        ):
+            return
 
         if self.chk_fit_window_cycles.isChecked():
             self._apply_fit_window_cycles()
@@ -3775,6 +4044,17 @@ class MainWindow(QMainWindow):
             solver=self._get_solver_settings(),
             Rmax_exp=_rmax_exp,
             bubble_model=self._bubble_model,
+            plugin_entrypoint=self._plugin_entrypoint_for_model(self._get_active_model_key()),
+            plugin_context=self._plugin_context(
+                model_key=self._get_active_model_key(),
+                Req=float(self.spin_Req_um.value()) * 1e-6,
+                NT=int(self.spin_NT.value()),
+                P_inf=float(self.spin_P_inf.value()),
+                rho=float(self.spin_rho.value()),
+                const=dict(self._model_constants),
+                solver=self._get_solver_settings(),
+                Rmax_exp=_rmax_exp,
+            ),
         )
         cfg = FitConfig(
             t_exp=t_windowed,
@@ -4062,6 +4342,7 @@ class MainWindow(QMainWindow):
             # --- metadata scalars ---
             export["P_inf"]     = float(self.spin_P_inf.value())
             export["rho"]       = float(self.spin_rho.value())
+            export["gamma"]     = float(self.spin_gamma.value())
             export["Req"]       = float(self.spin_Req_um.value()) * 1e-6
             export["model_key"] = self._get_active_model_key()
 

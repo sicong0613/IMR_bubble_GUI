@@ -387,7 +387,7 @@ class NhkvRmaxInputs:
     abs_tol: float = 1e-7
     solver_method: str = "BDF"
     bubble_model: str = "Keller-Miksis"
-    vapor_wall_derivative_cutoff: bool = True
+    vapor_wall_derivative_cutoff: bool = False
 
     # Far-field / material constants
     P_inf: float = 101325.0

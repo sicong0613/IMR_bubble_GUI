@@ -22,7 +22,8 @@ dist/
 imr_gui/settings.json
 
 # test data
-result_test/
+test/
+
 
 # Demo
 IMR_fitting_GUI_DEMO/

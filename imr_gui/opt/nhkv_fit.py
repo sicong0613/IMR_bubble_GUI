@@ -338,8 +338,21 @@ def fit_nhkv_to_experiment(
             step_size=step_size, status=status,
         ))
 
+    # --- build initial guess vector in optimizer space -------------------
+    x0 = np.array([
+        np.log10(max(initial_values.get(nm, 1.0), 1e-30)) if sc == "log"
+        else initial_values.get(nm, 1.0)
+        for nm, sc in active
+    ])
+    lb_arr = np.array([b[0] for b in opt_bounds])
+    ub_arr = np.array([b[1] for b in opt_bounds])
+    x0 = np.clip(x0, lb_arr, ub_arr)
+
     # --- initial guess evaluation ----------------------------------------
-    init_params = {n: initial_values.get(n, 1.0) for n in param_names}
+    # Evaluate the same bounded point that the optimizer will actually use.
+    # Otherwise an out-of-bounds GUI value can become an unbeatable baseline
+    # while every subsequent trial is clipped inside bounds.
+    init_params = _to_si_dict(x0)
     init_err, init_out = _eval_and_sim(init_params, cfg)
     tracker["nfev"] = 1
     if init_err < tracker["best_err"]:
@@ -357,16 +370,6 @@ def fit_nhkv_to_experiment(
             Rmax_sim=bo.Rmax_sim if bo else None, tc=bo.tc if bo else None,
             sim_out=bo,
         )
-
-    # --- build initial guess vector in optimizer space -------------------
-    x0 = np.array([
-        np.log10(max(initial_values.get(nm, 1.0), 1e-30)) if sc == "log"
-        else initial_values.get(nm, 1.0)
-        for nm, sc in active
-    ])
-    lb_arr = np.array([b[0] for b in opt_bounds])
-    ub_arr = np.array([b[1] for b in opt_bounds])
-    x0 = np.clip(x0, lb_arr, ub_arr)
 
     # --- run optimizer ---------------------------------------------------
     result = None

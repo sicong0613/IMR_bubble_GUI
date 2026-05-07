@@ -67,7 +67,7 @@
       "units": [{ "label": "Pa·s", "factor": 1.0 }],
       "default": 0.226,
       "lb": 0.01,
-      "ub": 1e2,
+      "ub": 1.0,
       "scale": "log",
       "fit_default": true
     },
