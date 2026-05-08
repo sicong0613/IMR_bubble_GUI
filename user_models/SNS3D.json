@@ -1,0 +1,99 @@
+{
+  "id": "SNS3D",
+  "display_name": "SNS3D",
+  "description": "Standard nonlinear solid model with 3 branches. With three Neo-Hookean springs and 2 dashpots, the third spring is subjected to damage.",
+  "solver_entrypoint": "sns3D_solver:simulate",
+  "parameters": [
+    {
+      "name": "U0",
+      "label": "U0",
+      "units": [
+        { "label": "m/s", "factor": 1.0 }
+      ],
+      "default": 100.0,
+      "lb": 80.0,
+      "ub": 120.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "G",
+      "label": "G",
+      "units": [
+        { "label": "Pa",  "factor": 1.0 },
+        { "label": "kPa", "factor": 1e3 },
+        { "label": "MPa", "factor": 1e6 }
+      ],
+      "default": 10000.0,
+      "lb": 100.0,
+      "ub": 1000000.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "G1",
+      "label": "G1",
+      "units": [
+        { "label": "Pa",  "factor": 1.0 },
+        { "label": "kPa", "factor": 1e3 },
+        { "label": "MPa", "factor": 1e6 }
+      ],
+      "default": 10000.0,
+      "lb": 100.0,
+      "ub": 1000000.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "mu1",
+      "label": "mu1",
+      "units": [
+        { "label": "Pa·s",  "factor": 1.0 }
+      ],
+      "default": 0.1,
+      "lb": 0.01,
+      "ub": 1.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "G2",
+      "label": "G2",
+      "units": [
+        { "label": "Pa",  "factor": 1.0 },
+        { "label": "kPa", "factor": 1e3 },
+        { "label": "MPa", "factor": 1e6 }
+      ],
+      "default": 10000.0,
+      "lb": 100.0,
+      "ub": 1000000.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "mu2",
+      "label": "mu2",
+      "units": [
+        { "label": "Pa·s",  "factor": 1.0 }
+      ],
+      "default": 0.1,
+      "lb": 0.01,
+      "ub": 1.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "damage_Y",
+      "label": "damage_Y",
+      "units": [
+        { "label": "-",  "factor": 1.0 }
+      ],
+      "default": 1.5,
+      "lb": 1.0,
+      "ub": 3.0,
+      "scale": "log",
+      "fit_default": true
+    }
+  ],
+  "constants": {}
+}

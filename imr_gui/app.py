@@ -417,9 +417,11 @@ class FitWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    APP_TITLE = "IMR Fitting GUI (beta 1.1)"
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IMR Fitting GUI (beta 1.1)")
+        self.setWindowTitle(self.APP_TITLE)
         self.resize(1200, 700)
 
         self.state = AppState()
@@ -457,6 +459,7 @@ class MainWindow(QMainWindow):
         self._saved_ui_defaults: dict = {}
         self._jobs: list[dict] = []
         self._editing_job_index: int | None = None
+        self._loading_job_to_editor: bool = False
         self._available_models = load_available_models()
 
         self._build_menu()
@@ -1168,6 +1171,13 @@ class MainWindow(QMainWindow):
         )
         lbl_ncg.setWordWrap(True)
         fncg.addRow(lbl_ncg)
+        self._chk_ncg_debug = QCheckBox("Write debug CSV logs")
+        self._chk_ncg_debug.setToolTip(
+            "Log every Newton-CG objective evaluation and callback iteration\n"
+            "to CSV files (ncg_debug_eval_<stamp>.csv and\n"
+            "ncg_debug_iter_<stamp>.csv) in the working directory."
+        )
+        fncg.addRow("Debug logging:", self._chk_ncg_debug)
         self._opt_stack.addWidget(pg_ncg)       # index 3
 
         # page 4 – Differential Evolution
@@ -1302,6 +1312,7 @@ class MainWindow(QMainWindow):
         self._spin_ps_contract.setValue(c.ps_mesh_contraction)
         self._spin_ps_search.setValue(c.ps_search_pts)
         self._chk_ps_debug.setChecked(c.ps_debug_log)
+        self._chk_ncg_debug.setChecked(c.ps_debug_log)
         self._cmb_de_strategy.setCurrentText(c.de_strategy)
         self._spin_de_maxiter.setValue(c.de_maxiter)
         self._spin_de_popsize.setValue(c.de_popsize)
@@ -1332,7 +1343,7 @@ class MainWindow(QMainWindow):
         c.ps_mesh_expansion = self._spin_ps_expand.value()
         c.ps_mesh_contraction = self._spin_ps_contract.value()
         c.ps_search_pts = self._spin_ps_search.value()
-        c.ps_debug_log = self._chk_ps_debug.isChecked()
+        c.ps_debug_log = self._chk_ps_debug.isChecked() or self._chk_ncg_debug.isChecked()
         c.de_strategy = self._cmb_de_strategy.currentText()
         c.de_maxiter = self._spin_de_maxiter.value()
         c.de_popsize = self._spin_de_popsize.value()
@@ -1791,9 +1802,12 @@ class MainWindow(QMainWindow):
                 self._act_jobs_mode.setChecked(self.state.mode == "jobs")
                 return
 
+        previous_mode = self.state.mode
         self.state.mode = mode
         is_fitting = mode == "fitting"
         is_jobs = mode == "jobs"
+        if previous_mode == "jobs" and not is_jobs and not self._loading_job_to_editor:
+            self._clear_job_preview_state()
         if not is_fitting:
             self._editing_job_index = None
 
@@ -1841,6 +1855,23 @@ class MainWindow(QMainWindow):
         is_dim = self.state.view_mode == "dimensional"
         self.btn_dim.setEnabled(not is_dim)
         self.btn_norm.setEnabled(is_dim)
+
+    def _update_window_title(self):
+        exp_path = self.state.exp_path
+        if exp_path:
+            name = Path(exp_path).name
+        else:
+            name = ""
+        self.setWindowTitle(f"{self.APP_TITLE} — {name}" if name else self.APP_TITLE)
+
+    def _clear_job_preview_state(self):
+        self._job_preview_fit_t = None
+        self._job_preview_fit_R = None
+        self._job_preview_fit_meta = None
+        self._job_preview_window = None
+        self.state.best_fit_t = None
+        self.state.best_fit_R = None
+        self.state.best_fit_meta = None
 
     def _get_unit_factor(self, param_name: str) -> float:
         row = self._param_rows.get(param_name)
@@ -2277,6 +2308,25 @@ class MainWindow(QMainWindow):
         if self.chk_fit_window_cycles.isChecked():
             self._apply_fit_window_cycles()
 
+    def _current_fit_window_seconds(
+        self,
+        t: np.ndarray,
+        R: np.ndarray,
+        model_key: str,
+    ) -> tuple[float, float, int]:
+        if self.chk_fit_window_cycles.isChecked():
+            cycles = int(self.spin_fit_window_cycles.value())
+            i0, i1, _found = self._fit_window_cycle_indices_for(t, R, cycles, model_key)
+            t_start_s = float(t[i0])
+            t_end_s = float(t[i1])
+        else:
+            t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
+            t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
+            cycles = int(self.spin_fit_window_cycles.value())
+        if t_start_s > t_end_s:
+            t_start_s, t_end_s = t_end_s, t_start_s
+        return t_start_s, t_end_s, cycles
+
     def _on_fit_window_dragged(self, which: str, x_view: float):
         if self.state.mode == "jobs":
             return
@@ -2456,6 +2506,7 @@ class MainWindow(QMainWindow):
             self.state.P_inf = exp.P_inf
             self.state.rho = exp.rho
             self.state.R_eq = exp.R_eq
+            self._update_window_title()
 
             self.state.sim_t = None
             self.state.sim_R = None
@@ -2683,24 +2734,21 @@ class MainWindow(QMainWindow):
             return None, "No parameters are selected for fitting."
 
         model_key = self._get_active_model_key()
-        if self.chk_fit_window_cycles.isChecked():
-            cycles = int(self.spin_fit_window_cycles.value())
-            i0, i1, _found = self._fit_window_cycle_indices_for(exp_t, exp_R, cycles, model_key)
-            t_start_s = float(exp_t[i0])
-            t_end_s = float(exp_t[i1])
-            window_mode = "auto_cycles"
-        else:
-            t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
-            t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
-            cycles = int(self.spin_fit_window_cycles.value())
-            window_mode = "manual"
-        if t_start_s > t_end_s:
-            t_start_s, t_end_s = t_end_s, t_start_s
+        t_start_s, t_end_s, cycles = self._current_fit_window_seconds(
+            exp_t, exp_R, model_key
+        )
+        window_mode = "auto_cycles" if self.chk_fit_window_cycles.isChecked() else "manual"
 
         mask = (exp_t >= t_start_s) & (exp_t <= t_end_s)
         n_points = int(np.count_nonzero(mask))
         if n_points < 3:
             return None, f"Fit window contains fewer than 3 points ({n_points})."
+
+        req_m = (
+            float(exp_R_eq)
+            if exp_R_eq is not None and np.isfinite(float(exp_R_eq)) and float(exp_R_eq) > 0.0
+            else float(self.spin_Req_um.value()) * 1e-6
+        )
 
         return {
             "version": 1,
@@ -2725,7 +2773,7 @@ class MainWindow(QMainWindow):
             "scales": dict(scales),
             "bounds_si": dict(bounds_si),
             "experiment_settings": {
-                "Req_um": float(self.spin_Req_um.value()),
+                "Req_um": float(req_m) * 1e6,
                 "tspan_us": float(self.spin_tspan_us.value()),
             },
             "fit_window": {
@@ -3033,6 +3081,7 @@ class MainWindow(QMainWindow):
         self.state.P_inf = exp.get("P_inf")
         self.state.rho = exp.get("rho")
         self.state.R_eq = exp.get("R_eq")
+        self._update_window_title()
 
         settings = job.get("experiment_settings", {})
         if settings.get("Req_um") is not None:
@@ -3086,7 +3135,11 @@ class MainWindow(QMainWindow):
         self.state.best_fit_R = job.get("best_fit_R")
         self.state.best_fit_meta = job.get("best_fit_meta")
         self._editing_job_index = idx if job.get("status") in ("queued", "failed") else None
-        self._set_mode("fitting")
+        self._loading_job_to_editor = True
+        try:
+            self._set_mode("fitting")
+        finally:
+            self._loading_job_to_editor = False
         self.btn_add_job.setText("Update job" if self._editing_job_index is not None else "Add to job list")
         self.statusBar().showMessage(f"Loaded job {idx + 1} to editor.")
         self._redraw_all()
@@ -3933,13 +3986,11 @@ class MainWindow(QMainWindow):
         if out.t_sim is None or out.R_sim is None or out.t_sim.size < 3 or out.R_sim.size < 3:
             return None, 0, "simulation output contains fewer than 3 points"
 
-        t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
-        t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
-        if t_start_s > t_end_s:
-            t_start_s, t_end_s = t_end_s, t_start_s
-
         t_exp = np.asarray(self.state.exp_t, dtype=float)
         R_exp = np.asarray(self.state.exp_R, dtype=float)
+        t_start_s, t_end_s, _cycles = self._current_fit_window_seconds(
+            t_exp, R_exp, self._get_active_model_key()
+        )
         mask = (t_exp >= t_start_s) & (t_exp <= t_end_s)
         t_windowed = t_exp[mask]
         R_windowed = R_exp[mask]
@@ -4011,13 +4062,11 @@ class MainWindow(QMainWindow):
         if self.chk_fit_window_cycles.isChecked():
             self._apply_fit_window_cycles()
 
-        t_start_s = float(self.spin_t_fit_start.value()) * 1e-6
-        t_end_s = float(self.spin_t_fit_end.value()) * 1e-6
-        if t_start_s > t_end_s:
-            t_start_s, t_end_s = t_end_s, t_start_s
-
         t_exp = self.state.exp_t
         R_exp = self.state.exp_R
+        t_start_s, t_end_s, _cycles = self._current_fit_window_seconds(
+            t_exp, R_exp, self._get_active_model_key()
+        )
         mask = (t_exp >= t_start_s) & (t_exp <= t_end_s)
         t_windowed = t_exp[mask]
         R_windowed = R_exp[mask]

@@ -439,6 +439,73 @@ def fit_nhkv_to_experiment(
         def _z_to_x(z):
             return lb_arr + span * _sigmoid(z)
 
+        _dbg = bool(opt_config.ps_debug_log)
+        _dbg_fid_eval = _dbg_fid_iter = None
+        _dbg_eval_writer = _dbg_iter_writer = None
+        _dbg_call_n = [0]
+        _dbg_iter_n = [0]
+        if _dbg:
+            _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _dbg_fid_eval = open(Path(f"ncg_debug_eval_{_stamp}.csv"), "w", newline="")
+            _dbg_fid_iter = open(Path(f"ncg_debug_iter_{_stamp}.csv"), "w", newline="")
+            _dbg_eval_writer = csv.writer(_dbg_fid_eval)
+            _dbg_iter_writer = csv.writer(_dbg_fid_iter)
+            _hdr_e = (
+                ["call", "phase"]
+                + [h for nm, _ in active for h in (nm, f"log10_{nm}")]
+                + [f"z_{nm}" for nm, _ in active]
+                + ["LSQErr", "elapsed_s"]
+            )
+            _hdr_i = (
+                ["iter"]
+                + [h for nm, _ in active for h in (f"{nm}_best", f"log10_{nm}_best")]
+                + ["LSQErr_best", "step", "funccount", "status"]
+            )
+            _dbg_eval_writer.writerow(_hdr_e)
+            _dbg_iter_writer.writerow(_hdr_i)
+
+            _row0 = [0, "initial"]
+            for _nm, _ in active:
+                _v = init_params.get(_nm, float("nan"))
+                _row0 += [f"{_v:.10e}", f"{np.log10(_v):.6f}" if _v > 0 else "nan"]
+            _row0 += [f"{z:.10e}" for z in _x_to_z(x0)]
+            _row0 += [f"{tracker['best_err']:.10e}", "0.0000"]
+            _dbg_eval_writer.writerow(_row0)
+            _dbg_fid_eval.flush()
+
+        def _dbg_log_eval(z, val: float, phase: str, elapsed: float):
+            if not _dbg:
+                return
+            _dbg_call_n[0] += 1
+            _x = _z_to_x(z)
+            _psi = _to_si_dict(_x)
+            _row = [_dbg_call_n[0], phase]
+            for _nm, _ in active:
+                _v = _psi.get(_nm, float("nan"))
+                _row += [f"{_v:.10e}", f"{np.log10(_v):.6f}" if _v > 0 else "nan"]
+            _row += [f"{float(zz):.10e}" for zz in np.asarray(z, dtype=float)]
+            _row += [f"{float(val):.10e}", f"{float(elapsed):.4f}"]
+            _dbg_eval_writer.writerow(_row)
+            _dbg_fid_eval.flush()
+
+        def _dbg_log_iter(step: float, status: str):
+            if not _dbg:
+                return
+            _dbg_iter_n[0] += 1
+            _bsi = tracker["best_params"] or {}
+            _row = [_dbg_iter_n[0]]
+            for _nm, _ in active:
+                _v = _bsi.get(_nm, float("nan"))
+                _row += [f"{_v:.10e}", f"{np.log10(_v):.6f}" if _v > 0 else "nan"]
+            _row += [
+                f"{tracker['best_err']:.10e}",
+                f"{float(step):.10e}",
+                tracker["nfev"],
+                status,
+            ]
+            _dbg_iter_writer.writerow(_row)
+            _dbg_fid_iter.flush()
+
         heartbeat_interval = 30
         stall_limit = max(120, 40 * (len(active) + 1))
         nc_state = {
@@ -454,7 +521,9 @@ def fit_nhkv_to_experiment(
                 raise _UserStop()
 
             before = float(tracker["best_err"])
+            _t0 = _time.perf_counter()
             val = obj(_z_to_x(z))
+            _dbg_log_eval(z, val, "objective", _time.perf_counter() - _t0)
             after = float(tracker["best_err"])
 
             if after < before:
@@ -475,6 +544,7 @@ def fit_nhkv_to_experiment(
                 z_now = np.asarray(z, dtype=float)
                 step = float(np.linalg.norm(z_now - nc_state["last_emit_z"]))
                 _emit_progress(step_size=step, status=status)
+                _dbg_log_iter(step, status)
                 nc_state["last_emit_nfev"] = int(tracker["nfev"])
                 nc_state["last_emit_best"] = float(tracker["best_err"])
                 nc_state["last_emit_z"] = z_now.copy()
@@ -512,6 +582,7 @@ def fit_nhkv_to_experiment(
             nc_state["last_emit_best"] = float(tracker["best_err"])
             nc_state["last_emit_z"] = cb_state["prev_z"].copy()
             _emit_progress(step_size=step, status=status)
+            _dbg_log_iter(step, status)
 
         try:
             minimize(
@@ -528,6 +599,11 @@ def fit_nhkv_to_experiment(
             )
         except _UserStop:
             pass
+        finally:
+            if _dbg_fid_eval is not None:
+                _dbg_fid_eval.close()
+            if _dbg_fid_iter is not None:
+                _dbg_fid_iter.close()
         result = None
 
     # ---- Pattern Search (GPS with GPSPositiveBasis2N) ----
