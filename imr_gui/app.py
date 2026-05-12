@@ -418,6 +418,20 @@ class FitWorker(QThread):
 
 class MainWindow(QMainWindow):
     APP_TITLE = "IMR Fitting GUI (beta 1.1)"
+    PARAM_INHERIT_ALIASES: dict[str, dict[str, str]] = {
+        "GMOD1": {
+            "GA": "GA1",
+            "alpha": "alpha1",
+            "GB": "GB1",
+            "beta": "beta1",
+        },
+        "GMOD2": {
+            "GA1": "GA",
+            "alpha1": "alpha",
+            "GB1": "GB",
+            "beta1": "beta",
+        },
+    }
 
     def __init__(self):
         super().__init__()
@@ -443,12 +457,14 @@ class MainWindow(QMainWindow):
         self._queue_output_dir: Path | None = None
         self._queue_current_index: int | None = None
         self._queue_fit_worker: FitWorker | None = None
+        self._queue_fit_workers: dict[int, FitWorker] = {}
         self._opt_config: OptConfig = OptConfig()
         self._job_success_threshold_enabled: bool = True
         self._job_success_lsqerr: float = 10.0
         self._job_output_dir: str = ""
         self._job_ask_output_dir: bool = True
         self._job_chain_best_fit_initial: bool = False
+        self._job_parallel_workers: int = 1
         self._queue_previous_seed: dict | None = None
 
         # model state
@@ -460,6 +476,7 @@ class MainWindow(QMainWindow):
         self._jobs: list[dict] = []
         self._editing_job_index: int | None = None
         self._loading_job_to_editor: bool = False
+        self._model_param_memory: dict[str, dict] = {}
         self._available_models = load_available_models()
 
         self._build_menu()
@@ -995,6 +1012,13 @@ class MainWindow(QMainWindow):
             "When running a queue, seed each queued job with the previous completed job's "
             "best-fit parameters if both jobs use the same model."
         )
+        spin_parallel = QSpinBox()
+        spin_parallel.setRange(1, 64)
+        spin_parallel.setValue(int(self._job_parallel_workers))
+        spin_parallel.setToolTip(
+            "Maximum number of queued fitting jobs to run at the same time. "
+            "If previous-best-fit chaining is enabled, the queue runs serially."
+        )
 
         def _browse_output_dir():
             start_dir = le_output_dir.text().strip()
@@ -1013,6 +1037,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("Default output folder:"), 1, 1)
         grid.addLayout(output_row, 1, 2)
         grid.addWidget(chk_chain_initial, 2, 0, 1, 3)
+        grid.addWidget(QLabel("Parallel workers:"), 3, 1)
+        grid.addWidget(spin_parallel, 3, 2)
         grid.setColumnStretch(2, 1)
         lay.addLayout(grid)
         lay.addStretch(1)
@@ -1028,6 +1054,7 @@ class MainWindow(QMainWindow):
             self._job_output_dir = le_output_dir.text().strip()
             self._job_ask_output_dir = chk_ask_dir.isChecked()
             self._job_chain_best_fit_initial = chk_chain_initial.isChecked()
+            self._job_parallel_workers = int(spin_parallel.value())
             self._save_settings()
             dlg.accept()
 
@@ -1455,6 +1482,43 @@ class MainWindow(QMainWindow):
         params = model_data.get("parameters", {})
         return params if isinstance(params, dict) else {}
 
+    def _remember_current_model_parameters(self) -> tuple[str | None, dict]:
+        if self._current_model is None or not self._param_rows:
+            return None, {}
+        model_key = self._current_model.id
+        snapshot = self._collect_parameter_defaults()
+        self._model_param_memory[model_key] = snapshot
+        return model_key, snapshot
+
+    def _parameter_state_for_model_switch(
+        self,
+        target_model: ConstitutiveModel,
+        inherited_params: dict,
+        source_model_key: str | None,
+    ) -> dict:
+        target_names = {p.name for p in target_model.parameters}
+        state: dict = {}
+
+        saved = self._parameter_defaults_for_model(target_model.id)
+        if isinstance(saved, dict):
+            state.update(saved)
+
+        remembered = self._model_param_memory.get(target_model.id)
+        if isinstance(remembered, dict):
+            state.update(remembered)
+
+        for name, value in inherited_params.items():
+            if name in target_names:
+                state[name] = value
+
+        alias_map = self.PARAM_INHERIT_ALIASES.get(target_model.id, {})
+        if source_model_key is not None and alias_map:
+            for target_name, source_name in alias_map.items():
+                if target_name in target_names and source_name in inherited_params:
+                    state[target_name] = inherited_params[source_name]
+
+        return state
+
     def _save_settings(self, show_status: bool = False, include_ui: bool = False):
         c = self._opt_config
         try:
@@ -1507,6 +1571,7 @@ class MainWindow(QMainWindow):
                 "output_dir": self._job_output_dir,
                 "ask_output_dir": self._job_ask_output_dir,
                 "chain_best_fit_initial": self._job_chain_best_fit_initial,
+                "parallel_workers": self._job_parallel_workers,
             },
         }
         if include_ui:
@@ -1607,6 +1672,8 @@ class MainWindow(QMainWindow):
             self._job_ask_output_dir = bool(job_list["ask_output_dir"])
         if "chain_best_fit_initial" in job_list:
             self._job_chain_best_fit_initial = bool(job_list["chain_best_fit_initial"])
+        if "parallel_workers" in job_list:
+            self._job_parallel_workers = max(1, int(job_list["parallel_workers"]))
 
         if ui.get("Req_um") is not None:
             self.spin_Req_um.setValue(float(ui["Req_um"]))
@@ -1631,12 +1698,19 @@ class MainWindow(QMainWindow):
         loader = self._available_models.get(model_key)
         if not loader:
             return
+        old_model_key, inherited_params = self._remember_current_model_parameters()
         model = loader()
         self._current_model = model
         self._model_constants = model.constants
         self._param_box.setTitle(f"Parameters ({model.display_name})")
         self._rebuild_param_panel(model)
-        self._apply_parameter_defaults(self._parameter_defaults_for_model(model_key))
+        if old_model_key is None:
+            params_to_apply = self._parameter_defaults_for_model(model_key)
+        else:
+            params_to_apply = self._parameter_state_for_model_switch(
+                model, inherited_params, old_model_key
+            )
+        self._apply_parameter_defaults(params_to_apply)
         self._set_mode(self.state.mode)  # refresh fit-control visibility
         # GMOD models require much tighter ODE tolerances than NHKV.
         if model_key in ("GMOD1", "GMOD2"):
@@ -3648,61 +3722,101 @@ class MainWindow(QMainWindow):
         self._queue_running = True
         self._queue_stop_after_current = False
         self._queue_previous_seed = None
+        self._queue_fit_workers = {}
+        effective_workers = self._effective_queue_parallel_workers()
+        chain_note = " (serial because previous-best-fit chaining is enabled)" if self._job_chain_best_fit_initial else ""
+        self.lbl_output.setPlainText(
+            f"Starting job queue with {effective_workers} worker(s){chain_note}."
+        )
         self._start_next_queue_job()
 
     def on_stop_queue_after_current(self):
         if self._queue_running:
             self._queue_stop_after_current = True
             self.btn_stop_jobs.setEnabled(False)
-            if self._queue_fit_worker is not None and self._queue_fit_worker.isRunning():
-                self._queue_fit_worker.request_stop()
-                self.statusBar().showMessage("Stopping current queue job...")
+            running_workers = list(self._queue_fit_workers.values())
+            if (
+                self._queue_fit_worker is not None
+                and self._queue_fit_worker.isRunning()
+                and self._queue_fit_worker not in running_workers
+            ):
+                running_workers.append(self._queue_fit_worker)
+            if running_workers:
+                for worker in running_workers:
+                    worker.request_stop()
+                self.statusBar().showMessage("Stopping queue...")
             else:
-                self.statusBar().showMessage("Queue will stop after the current job.")
+                self.statusBar().showMessage("Queue will stop.")
 
     def _start_next_queue_job(self):
+        if not self._queue_running:
+            return
         if self._queue_stop_after_current:
+            if self._queue_fit_workers:
+                return
             self._finish_queue("Queue stopped after current job.")
             return
 
-        next_idx = None
-        for i, job in enumerate(self._jobs):
-            if job.get("status") == "queued":
-                next_idx = i
+        capacity = self._effective_queue_parallel_workers()
+        started = False
+        while len(self._queue_fit_workers) < capacity:
+            next_idx = None
+            for i, job in enumerate(self._jobs):
+                if job.get("status") == "queued":
+                    next_idx = i
+                    break
+            if next_idx is None:
                 break
+            self._start_queue_job(next_idx)
+            started = True
 
-        if next_idx is None:
+        if not started and not self._queue_fit_workers and not any(
+            job.get("status") == "queued" for job in self._jobs
+        ):
             self._finish_queue("Queue completed.")
             return
 
-        self._queue_current_index = next_idx
+        self._update_job_buttons()
+
+    def _effective_queue_parallel_workers(self) -> int:
+        if self._job_chain_best_fit_initial:
+            return 1
+        return max(1, int(self._job_parallel_workers))
+
+    def _start_queue_job(self, next_idx: int):
         job = self._jobs[next_idx]
+        self._queue_current_index = next_idx
         job["status"] = "running"
         job["error"] = None
         job.pop("_runtime_initial_values", None)
         self._refresh_job_table()
-        self.tbl_jobs.selectRow(next_idx)
+        if len(self._queue_fit_workers) == 0:
+            self.tbl_jobs.selectRow(next_idx)
 
-        self.state.sim_t = None
-        self.state.sim_R = None
-        self.state.sim_meta = None
-        self.state.best_fit_t = None
-        self.state.best_fit_R = None
-        self.state.best_fit_meta = None
-        self.lbl_output.setPlainText(
-            f"Running queue job {next_idx + 1}/{len(self._jobs)}: "
+        if self.tbl_jobs.currentRow() == next_idx:
+            self.state.sim_t = None
+            self.state.sim_R = None
+            self.state.sim_meta = None
+            self.state.best_fit_t = None
+            self.state.best_fit_R = None
+            self.state.best_fit_meta = None
+        prefix = "Running queue" if not self._queue_fit_workers else "Starting queue"
+        self.lbl_output.appendPlainText(
+            f"{prefix} job {next_idx + 1}/{len(self._jobs)}: "
             f"{job['experiment']['file_name']}\n"
-            f"Fitting {job.get('model', '')} with {job.get('physics', {}).get('bubble_model', 'Keller-Miksis')}"
+            f"Fitting {job.get('model', '')} with "
+            f"{job.get('physics', {}).get('bubble_model', 'Keller-Miksis')}"
         )
         self._prepare_chained_initial_values(job, next_idx)
         self._redraw_all()
 
-        self._queue_fit_worker = self._make_job_fit_worker(job)
-        self._queue_fit_worker.progress.connect(self._on_queue_fit_progress)
-        self._queue_fit_worker.finished_ok.connect(self._on_queue_fit_ok)
-        self._queue_fit_worker.failed.connect(self._on_queue_fit_fail)
-        self._queue_fit_worker.start()
-        self._update_job_buttons()
+        worker = self._make_job_fit_worker(job)
+        self._queue_fit_workers[next_idx] = worker
+        self._queue_fit_worker = worker
+        worker.progress.connect(lambda prog, idx=next_idx, w=worker: self._on_queue_fit_progress(prog, idx, w))
+        worker.finished_ok.connect(lambda res, idx=next_idx, w=worker: self._on_queue_fit_ok(res, idx, w))
+        worker.failed.connect(lambda msg, tb, idx=next_idx, w=worker: self._on_queue_fit_fail(msg, tb, idx, w))
+        worker.start()
 
     def _prepare_chained_initial_values(self, job: dict, idx: int):
         if not self._job_chain_best_fit_initial:
@@ -3759,12 +3873,14 @@ class MainWindow(QMainWindow):
         self._queue_stop_after_current = False
         self._queue_current_index = None
         self._queue_fit_worker = None
+        self._queue_fit_workers = {}
         self._queue_previous_seed = None
         self._update_job_buttons()
         self.statusBar().showMessage(message)
 
-    def _on_queue_fit_progress(self, prog: FitProgress):
-        idx = self._queue_current_index
+    def _on_queue_fit_progress(self, prog: FitProgress, idx: int | None = None, worker: FitWorker | None = None):
+        if idx is None:
+            idx = self._queue_current_index
         if idx is None:
             return
         job = self._jobs[idx]
@@ -3775,24 +3891,29 @@ class MainWindow(QMainWindow):
         job["best_fit_t"] = np.array(prog.t_sim, dtype=float).copy() if prog.t_sim is not None else None
         job["best_fit_R"] = np.array(prog.R_sim, dtype=float).copy() if prog.R_sim is not None else None
 
-        self.state.best_fit_t = prog.t_sim
-        self.state.best_fit_R = prog.R_sim
-        self.state.best_fit_meta = job.get("best_fit_meta")
+        selected_idx = self._selected_job_index()
+        if selected_idx == idx:
+            self.state.best_fit_t = prog.t_sim
+            self.state.best_fit_R = prog.R_sim
+            self.state.best_fit_meta = job.get("best_fit_meta")
         status_info = f"  [{prog.status}]" if prog.status else ""
         self.lbl_output.appendPlainText(
             f"job={idx + 1}\t|\tnfev={prog.nfev}\t|\tLSQErr={prog.best_err:.4e}"
             f"{status_info}"
         )
         target = float(job.get("optimizer", {}).get("f_tol", 0.0))
-        if target > 0 and prog.best_err <= target and self._queue_fit_worker is not None:
-            self._queue_fit_worker.request_stop()
+        stop_worker = worker or self._queue_fit_workers.get(idx)
+        if target > 0 and prog.best_err <= target and stop_worker is not None:
+            stop_worker.request_stop()
             self.lbl_output.appendPlainText(
                 f"job={idx + 1}\t|\tLSQErr target reached ({target:.4e}); stopping fit"
             )
-        self._redraw_all()
+        if selected_idx == idx:
+            self._redraw_all()
 
-    def _on_queue_fit_ok(self, res: FitResult):
-        idx = self._queue_current_index
+    def _on_queue_fit_ok(self, res: FitResult, idx: int | None = None, worker: FitWorker | None = None):
+        if idx is None:
+            idx = self._queue_current_index
         if idx is None:
             return
         job = self._jobs[idx]
@@ -3829,25 +3950,42 @@ class MainWindow(QMainWindow):
                 job["status"] = "failed"
                 job["error"] = f"Export failed: {e}"
 
-        if self._queue_fit_worker is not None:
-            self._queue_fit_worker.wait(5000)
-        self._queue_fit_worker = None
+        done_worker = worker or self._queue_fit_workers.get(idx)
+        if done_worker is not None:
+            done_worker.wait(5000)
+        self._queue_fit_workers.pop(idx, None)
+        self._queue_fit_worker = next(iter(self._queue_fit_workers.values()), None)
         self._remember_queue_seed_from_job(idx)
         self._refresh_job_table()
+        if self._queue_stop_after_current:
+            if not self._queue_fit_workers:
+                self._finish_queue("Queue stopped.")
+            else:
+                self._update_job_buttons()
+            return
         QTimer.singleShot(0, self._start_next_queue_job)
 
-    def _on_queue_fit_fail(self, msg: str, tb: str):
-        idx = self._queue_current_index
+    def _on_queue_fit_fail(self, msg: str, tb: str, idx: int | None = None, worker: FitWorker | None = None):
+        if idx is None:
+            idx = self._queue_current_index
         if idx is None:
             return
         job = self._jobs[idx]
         job["status"] = "failed"
         job["error"] = f"{msg}\n\n{tb}"
-        if self._queue_fit_worker is not None:
-            self._queue_fit_worker.wait(5000)
-        self._queue_fit_worker = None
+        done_worker = worker or self._queue_fit_workers.get(idx)
+        if done_worker is not None:
+            done_worker.wait(5000)
+        self._queue_fit_workers.pop(idx, None)
+        self._queue_fit_worker = next(iter(self._queue_fit_workers.values()), None)
         self._remember_queue_seed_from_job(idx)
         self._refresh_job_table()
+        if self._queue_stop_after_current:
+            if not self._queue_fit_workers:
+                self._finish_queue("Queue stopped.")
+            else:
+                self._update_job_buttons()
+            return
         QTimer.singleShot(0, self._start_next_queue_job)
 
     # =====================================================================

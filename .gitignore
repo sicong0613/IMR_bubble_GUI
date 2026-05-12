@@ -31,6 +31,7 @@ IMR_fitting_GUI_DEMO/
 # settings for development
 .claude/
 imr_gui/settings.json
+user_models_ready2ues/
 
 # Fitting/debug scratch outputs
 ps_debug_*.csv
