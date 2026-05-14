@@ -465,6 +465,8 @@ class MainWindow(QMainWindow):
         self._job_ask_output_dir: bool = True
         self._job_chain_best_fit_initial: bool = False
         self._job_parallel_workers: int = 1
+        self._job_import_name_cleanup_enabled: bool = True
+        self._job_import_name_cleanup_regex: str = ""
         self._queue_previous_seed: dict | None = None
 
         # model state
@@ -1019,6 +1021,33 @@ class MainWindow(QMainWindow):
             "Maximum number of queued fitting jobs to run at the same time. "
             "If previous-best-fit chaining is enabled, the queue runs serially."
         )
+        le_cleanup_regex = QLineEdit(self._job_import_name_cleanup_regex)
+        le_cleanup_regex.setPlaceholderText(r"e.g. ^job_\d+_?; _SNOD; _result; _converted")
+        le_cleanup_regex.setToolTip(
+            "Semicolon-separated regex patterns removed from experiment names "
+            "when importing jobs/results. Leave empty to keep names unchanged."
+        )
+        chk_cleanup_regex = QCheckBox("Enable")
+        chk_cleanup_regex.setChecked(self._job_import_name_cleanup_enabled)
+        le_cleanup_regex.setEnabled(chk_cleanup_regex.isChecked())
+        chk_cleanup_regex.toggled.connect(le_cleanup_regex.setEnabled)
+        btn_cleanup_info = QToolButton()
+        btn_cleanup_info.setText("?")
+        btn_cleanup_info.setAutoRaise(True)
+        btn_cleanup_info.setToolTip(
+            "Optional semicolon-separated Python regular expressions used only "
+            "when importing jobs/results.\n"
+            "Each pattern is removed in order from the displayed experiment name.\n\n"
+            "Example:\n"
+            r"^job_\d+_?; _SNOD; _result; _converted"
+            "\ncan turn\n"
+            "job_001_Jin_13_42_19_converted_SNOD_result.mat\n"
+            "into\n"
+            "Jin_13_42_19.mat"
+        )
+        cleanup_row = QHBoxLayout()
+        cleanup_row.addWidget(le_cleanup_regex, stretch=1)
+        cleanup_row.addWidget(btn_cleanup_info)
 
         def _browse_output_dir():
             start_dir = le_output_dir.text().strip()
@@ -1030,15 +1059,18 @@ class MainWindow(QMainWindow):
 
         btn_browse.clicked.connect(_browse_output_dir)
 
-        grid.addWidget(chk_threshold, 0, 0)
-        grid.addWidget(QLabel("Success LSQErr threshold:"), 0, 1)
-        grid.addWidget(spin_threshold, 0, 2)
-        grid.addWidget(chk_ask_dir, 1, 0)
-        grid.addWidget(QLabel("Default output folder:"), 1, 1)
-        grid.addLayout(output_row, 1, 2)
-        grid.addWidget(chk_chain_initial, 2, 0, 1, 3)
-        grid.addWidget(QLabel("Parallel workers:"), 3, 1)
-        grid.addWidget(spin_parallel, 3, 2)
+        grid.addWidget(QLabel("Parallel workers:"), 0, 1)
+        grid.addWidget(spin_parallel, 0, 2)
+        grid.addWidget(chk_threshold, 1, 0)
+        grid.addWidget(QLabel("Success LSQErr threshold:"), 1, 1)
+        grid.addWidget(spin_threshold, 1, 2)
+        grid.addWidget(chk_ask_dir, 2, 0)
+        grid.addWidget(QLabel("Default output folder:"), 2, 1)
+        grid.addLayout(output_row, 2, 2)
+        grid.addWidget(chk_cleanup_regex, 3, 0)
+        grid.addWidget(QLabel("Import name cleanup regex:"), 3, 1)
+        grid.addLayout(cleanup_row, 3, 2)
+        grid.addWidget(chk_chain_initial, 4, 0, 1, 3)
         grid.setColumnStretch(2, 1)
         lay.addLayout(grid)
         lay.addStretch(1)
@@ -1055,6 +1087,21 @@ class MainWindow(QMainWindow):
             self._job_ask_output_dir = chk_ask_dir.isChecked()
             self._job_chain_best_fit_initial = chk_chain_initial.isChecked()
             self._job_parallel_workers = int(spin_parallel.value())
+            cleanup_regex = le_cleanup_regex.text().strip()
+            if chk_cleanup_regex.isChecked() and cleanup_regex:
+                for pattern in self._split_cleanup_patterns(cleanup_regex):
+                    try:
+                        re.compile(pattern)
+                    except re.error as exc:
+                        QMessageBox.warning(
+                            dlg,
+                            "Invalid regex",
+                            f"Import name cleanup regex is invalid:\n\n"
+                            f"{pattern}\n\n{exc}",
+                        )
+                        return
+            self._job_import_name_cleanup_enabled = chk_cleanup_regex.isChecked()
+            self._job_import_name_cleanup_regex = cleanup_regex
             self._save_settings()
             dlg.accept()
 
@@ -1572,6 +1619,8 @@ class MainWindow(QMainWindow):
                 "ask_output_dir": self._job_ask_output_dir,
                 "chain_best_fit_initial": self._job_chain_best_fit_initial,
                 "parallel_workers": self._job_parallel_workers,
+                "import_name_cleanup_enabled": self._job_import_name_cleanup_enabled,
+                "import_name_cleanup_regex": self._job_import_name_cleanup_regex,
             },
         }
         if include_ui:
@@ -1674,6 +1723,10 @@ class MainWindow(QMainWindow):
             self._job_chain_best_fit_initial = bool(job_list["chain_best_fit_initial"])
         if "parallel_workers" in job_list:
             self._job_parallel_workers = max(1, int(job_list["parallel_workers"]))
+        if "import_name_cleanup_enabled" in job_list:
+            self._job_import_name_cleanup_enabled = bool(job_list["import_name_cleanup_enabled"])
+        if "import_name_cleanup_regex" in job_list:
+            self._job_import_name_cleanup_regex = str(job_list["import_name_cleanup_regex"])
 
         if ui.get("Req_um") is not None:
             self.spin_Req_um.setValue(float(ui["Req_um"]))
@@ -1882,8 +1935,6 @@ class MainWindow(QMainWindow):
         is_jobs = mode == "jobs"
         if previous_mode == "jobs" and not is_jobs and not self._loading_job_to_editor:
             self._clear_job_preview_state()
-        if not is_fitting:
-            self._editing_job_index = None
 
         for fw in self._fit_widgets.values():
             fw["row_widget"].setEnabled(is_fitting)
@@ -1895,7 +1946,12 @@ class MainWindow(QMainWindow):
         self.btn_primary_action.setText("Fit" if is_fitting else "Simulate")
         self.btn_primary_action.setEnabled(not is_jobs)
         self.btn_add_job.setEnabled(is_fitting)
-        self.btn_add_job.setText("Update job" if is_fitting and self._editing_job_index is not None else "Add to job list")
+        if is_fitting:
+            self.btn_add_job.setText("Update job" if self._editing_job_index is not None else "Add to job list")
+            self.btn_add_job.setToolTip("Update the loaded job." if self._editing_job_index is not None else "Add the current fitting setup as a queued job.")
+        else:
+            self.btn_add_job.setText("Use fitting to add job")
+            self.btn_add_job.setToolTip("Switch to Fitting mode to add or update a job.")
         self._act_load_exp.setEnabled(not is_jobs)
         self._act_load_params.setEnabled(not is_jobs)
         self._act_save_params.setEnabled(not is_jobs)
@@ -2580,6 +2636,10 @@ class MainWindow(QMainWindow):
             self.state.P_inf = exp.P_inf
             self.state.rho = exp.rho
             self.state.R_eq = exp.R_eq
+            self._editing_job_index = None
+            if self.state.mode == "fitting":
+                self.btn_add_job.setText("Add to job list")
+                self.btn_add_job.setToolTip("Add the current fitting setup as a queued job.")
             self._update_window_title()
 
             self.state.sim_t = None
@@ -2670,6 +2730,29 @@ class MainWindow(QMainWindow):
     def _job_model_label(model_key: str) -> str:
         labels = {"NHKV (Rmax)": "Rmax"}
         return labels.get(model_key, model_key)
+
+    @staticmethod
+    def _split_cleanup_patterns(patterns: str) -> list[str]:
+        return [p.strip() for p in str(patterns or "").split(";") if p.strip()]
+
+    def _clean_imported_experiment_name(self, name: str) -> str:
+        text = str(name or "")
+        if not self._job_import_name_cleanup_enabled:
+            return text
+        patterns = self._split_cleanup_patterns(self._job_import_name_cleanup_regex)
+        if not patterns:
+            return text
+        cleaned = text
+        try:
+            for pattern in patterns:
+                cleaned = re.sub(pattern, "", cleaned)
+        except re.error:
+            return text
+        cleaned = cleaned.strip(" _-.")
+        suffix = Path(text).suffix
+        if suffix and not cleaned.lower().endswith(suffix.lower()):
+            cleaned = f"{cleaned}{suffix}"
+        return cleaned or text
 
     def _selected_job_index(self) -> int | None:
         ranges = self.tbl_jobs.selectedRanges()
@@ -2906,6 +2989,9 @@ class MainWindow(QMainWindow):
 
         exp_path = self.state.exp_path or ""
         exp_name = Path(exp_path).name if exp_path else "loaded experiment"
+        if self._editing_job_index is not None and 0 <= self._editing_job_index < len(self._jobs):
+            existing_exp = self._jobs[self._editing_job_index].get("experiment", {})
+            exp_name = existing_exp.get("file_name") or exp_name
         job, error = self._build_fit_job_snapshot_from_data(
             exp_t=self.state.exp_t,
             exp_R=self.state.exp_R,
@@ -2940,6 +3026,10 @@ class MainWindow(QMainWindow):
                 self._select_job_row(idx)
                 self._editing_job_index = None
                 self.btn_add_job.setText("Add to job list")
+                self.btn_add_job.setToolTip("Add the current fitting setup as a queued job.")
+                self.state.sim_t = None
+                self.state.sim_R = None
+                self.state.sim_meta = None
                 self.state.best_fit_t = None
                 self.state.best_fit_R = None
                 self.state.best_fit_meta = None
@@ -2997,6 +3087,15 @@ class MainWindow(QMainWindow):
                 progress.setValue(i - 1)
                 QApplication.processEvents()
                 try:
+                    try:
+                        mat = loadmat(path, squeeze_me=True, struct_as_record=False)
+                        result_job = self._job_from_result_mat(path, mat)
+                    except Exception:
+                        result_job = None
+                    if result_job is not None:
+                        added.append(result_job)
+                        continue
+
                     exp = load_experiment_mat(path)
                     exp_R_eq = exp.R_eq
                     if exp_R_eq is None and exp.R.size > 0:
@@ -3005,7 +3104,7 @@ class MainWindow(QMainWindow):
                         exp_t=exp.t,
                         exp_R=exp.R,
                         exp_path=exp.source_path,
-                        exp_name=Path(exp.source_path).name,
+                        exp_name=self._clean_imported_experiment_name(Path(exp.source_path).name),
                         exp_P_inf=exp.P_inf,
                         exp_rho=exp.rho,
                         exp_R_eq=exp_R_eq,
@@ -3049,6 +3148,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Cannot remove", "Only queued or failed jobs can be removed.")
             return
         del self._jobs[idx]
+        if self._editing_job_index == idx:
+            self._editing_job_index = None
+        elif self._editing_job_index is not None and self._editing_job_index > idx:
+            self._editing_job_index -= 1
         self._refresh_job_table()
 
     def on_clear_completed_jobs(self):
@@ -3339,6 +3442,204 @@ class MainWindow(QMainWindow):
             return value
 
     @staticmethod
+    def _mat_array(mat: dict, key: str) -> np.ndarray:
+        if key not in mat:
+            return np.array([], dtype=float)
+        return np.asarray(mat[key], dtype=float).reshape(-1)
+
+    @staticmethod
+    def _parse_struct_best_fit_from_mat(mat: dict) -> dict[str, dict]:
+        if "struct_best_fit" not in mat:
+            return {}
+        flat = np.ravel(mat["struct_best_fit"])
+
+        def _to_str(rec, field: str) -> str:
+            val = getattr(rec, field)
+            arr = np.asarray(val)
+            if arr.size == 0:
+                return ""
+            item = arr.reshape(-1)[0]
+            if isinstance(item, bytes):
+                return item.decode(errors="replace").strip()
+            return str(item).strip()
+
+        def _to_float(rec, field: str, default: float = np.nan) -> float:
+            try:
+                arr = np.asarray(getattr(rec, field), dtype=float).reshape(-1)
+                return float(arr[0]) if arr.size else default
+            except Exception:
+                return default
+
+        out: dict[str, dict] = {}
+        for rec in flat:
+            try:
+                name = _to_str(rec, "name")
+                if not name or "MCOS" in name:
+                    continue
+                out[name] = {
+                    "value": _to_float(rec, "value"),
+                    "lb": _to_float(rec, "lb"),
+                    "ub": _to_float(rec, "ub"),
+                    "scale": _to_str(rec, "scale") or "lin",
+                }
+            except Exception:
+                continue
+        return out
+
+    def _job_from_result_mat(self, path: str, mat: dict) -> dict | None:
+        t_sim = self._mat_array(mat, "t_sim")
+        R_sim = self._mat_array(mat, "R_sim")
+        t_exp = self._mat_array(mat, "t_exp")
+        R_exp = self._mat_array(mat, "R_exp")
+        if t_sim.size < 3 or R_sim.size < 3 or t_exp.size < 3 or R_exp.size < 3:
+            return None
+
+        params = self._parse_struct_best_fit_from_mat(mat)
+        best_params = {
+            name: float(meta["value"])
+            for name, meta in params.items()
+            if np.isfinite(float(meta.get("value", np.nan)))
+        }
+        param_defaults = {
+            name: {
+                "value_si": float(meta.get("value", np.nan)),
+                "unit_index": 0,
+                "fit": True,
+                "lb_si": float(meta.get("lb", np.nan)),
+                "ub_si": float(meta.get("ub", np.nan)),
+                "scale": str(meta.get("scale", "lin") or "lin"),
+            }
+            for name, meta in params.items()
+        }
+        bounds_si = {
+            name: (float(meta.get("lb", np.nan)), float(meta.get("ub", np.nan)))
+            for name, meta in params.items()
+        }
+        scales = {name: str(meta.get("scale", "lin") or "lin") for name, meta in params.items()}
+        fit_flags = {name: True for name in params}
+
+        model_key = self._mat_to_string(mat, "model_key", "")
+        req_m = self._none_if_nan(self._mat_to_float(mat, "Req", None))
+        p_inf = self._none_if_nan(self._mat_to_float(mat, "P_inf", None))
+        rho = self._none_if_nan(self._mat_to_float(mat, "rho", None))
+        gamma = self._none_if_nan(self._mat_to_float(mat, "gamma", None))
+        tc = self._mat_to_float(mat, "tc", 1.0)
+        rmax_sim = self._mat_to_float(mat, "Rmax_sim", float(np.max(R_sim)))
+        lsq_err = self._none_if_nan(self._mat_to_float(mat, "LSQErr", None))
+        status = "completed"
+        error = None
+        if (
+            bool(self._job_success_threshold_enabled)
+            and lsq_err is not None
+            and float(lsq_err) > float(self._job_success_lsqerr)
+        ):
+            status = "failed"
+            error = (
+                f"Imported result LSQErr {float(lsq_err):.6g} exceeds success "
+                f"threshold {float(self._job_success_lsqerr):.6g}."
+            )
+
+        has_saved_window = (
+            "fit_window_t_start_s" in mat
+            and "fit_window_t_end_s" in mat
+        )
+        t_start = self._mat_to_float(mat, "fit_window_t_start_s", np.nan)
+        t_end = self._mat_to_float(mat, "fit_window_t_end_s", np.nan)
+        fw_mode = self._mat_to_string(mat, "fit_window_mode", "") or ""
+        fw_cycles_raw = self._none_if_nan(self._mat_to_float(mat, "fit_window_cycles", None))
+        if not has_saved_window or not np.isfinite(t_start) or not np.isfinite(t_end):
+            model_for_window = model_key or self._get_active_model_key()
+            t_start, t_end, cycles_from_gui = self._current_fit_window_seconds(
+                t_exp, R_exp, model_for_window
+            )
+            fw_mode = "auto_cycles" if self.chk_fit_window_cycles.isChecked() else "manual"
+            fw_cycles_raw = cycles_from_gui
+        fw_cycles = None if fw_cycles_raw is None else int(fw_cycles_raw)
+        fw_n_points = int(self._mat_to_float(
+            mat,
+            "fit_window_n_points",
+            np.count_nonzero((t_exp >= t_start) & (t_exp <= t_end)),
+        ))
+        optimizer = asdict(self._opt_config)
+        optimizer_json = self._mat_to_string(mat, "optimizer_json", "").strip()
+        if optimizer_json:
+            try:
+                loaded_optimizer = json.loads(optimizer_json)
+                if isinstance(loaded_optimizer, dict):
+                    valid_keys = set(OptConfig.__dataclass_fields__.keys())
+                    optimizer.update({
+                        key: value
+                        for key, value in loaded_optimizer.items()
+                        if key in valid_keys
+                    })
+            except Exception:
+                pass
+        else:
+            optimizer_method = self._mat_to_string(mat, "optimizer_method", "").strip()
+            if optimizer_method:
+                optimizer["method"] = optimizer_method
+        source_name = self._mat_to_string(mat, "file_name", "") or Path(path).name
+        source_name = self._clean_imported_experiment_name(source_name)
+        tspan_us = float(np.max(t_sim) - np.min(t_sim)) * 1e6 if t_sim.size else 0.0
+
+        try:
+            result_bytes = Path(path).read_bytes()
+        except Exception:
+            result_bytes = None
+
+        return {
+            "version": 1,
+            "type": "fit",
+            "status": status,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "experiment": {
+                "path": path,
+                "file_name": source_name,
+                "t": np.array(t_exp, dtype=float).copy(),
+                "R": np.array(R_exp, dtype=float).copy(),
+                "P_inf": p_inf,
+                "rho": rho,
+                "R_eq": req_m,
+            },
+            "model": model_key,
+            "solver_entrypoint": self._plugin_entrypoint_for_model(model_key) if model_key else "",
+            "constants": {},
+            "parameters": param_defaults,
+            "initial_values": dict(best_params),
+            "fit_flags": fit_flags,
+            "scales": scales,
+            "bounds_si": bounds_si,
+            "experiment_settings": {
+                "Req_um": float(req_m) * 1e6 if req_m is not None else None,
+                "tspan_us": tspan_us,
+            },
+            "fit_window": {
+                "mode": fw_mode,
+                "cycles": fw_cycles,
+                "t_start_s": t_start,
+                "t_end_s": t_end,
+                "n_points": fw_n_points,
+            },
+            "physics": {
+                "bubble_model": self._mat_to_string(mat, "bubble_model", "Keller-Miksis"),
+                "P_inf": p_inf,
+                "rho": rho,
+                "gamma": gamma,
+                "NT": int(self._mat_to_float(mat, "NT", 500)),
+            },
+            "optimizer": optimizer,
+            "result": None,
+            "lsq_err": lsq_err,
+            "best_params": best_params,
+            "best_fit_t": np.array(t_sim, dtype=float).copy(),
+            "best_fit_R": np.array(R_sim, dtype=float).copy(),
+            "best_fit_meta": {"Rmax": rmax_sim, "t_rmax": 0.0, "tc": tc},
+            "archived_result_mat": result_bytes,
+            "export_path": path,
+            "error": error,
+        }
+
+    @staticmethod
     def _mat_bytes(data: dict) -> bytes:
         buf = BytesIO()
         savemat(buf, data)
@@ -3422,6 +3723,17 @@ class MainWindow(QMainWindow):
             "model_key": job["model"],
             "LSQErr": float(res.lsq_err),
         }
+        fit_window = dict(job.get("fit_window", {}) or {})
+        export["fit_window_mode"] = str(fit_window.get("mode", ""))
+        export["fit_window_cycles"] = (
+            np.nan if fit_window.get("cycles") is None else int(fit_window.get("cycles"))
+        )
+        export["fit_window_t_start_s"] = float(fit_window.get("t_start_s", np.nan))
+        export["fit_window_t_end_s"] = float(fit_window.get("t_end_s", np.nan))
+        export["fit_window_n_points"] = int(fit_window.get("n_points", 0))
+        optimizer = dict(job.get("optimizer", {}) or {})
+        export["optimizer_json"] = json.dumps(self._json_safe(optimizer), ensure_ascii=False)
+        export["optimizer_method"] = str(optimizer.get("method", ""))
 
         names = list(job["parameters"].keys())
         dtype = np.dtype([
@@ -3497,7 +3809,9 @@ class MainWindow(QMainWindow):
         if preview is not None:
             meta["preview_file"] = f"previews/job_{row:03d}_preview.mat"
         if self._job_result_mat_bytes(job) is not None:
-            meta["result_file"] = f"results/job_{row:03d}_result.mat"
+            exp_stem = self._safe_filename_part(Path(str(exp.get("file_name", ""))).stem)
+            model = self._safe_filename_part(self._job_model_label(str(job.get("model", ""))))
+            meta["result_file"] = f"results/job_{row:03d}_{exp_stem}_{model}_result.mat"
         return self._json_safe(meta)
 
     def on_export_job_queue(self):
@@ -3579,7 +3893,9 @@ class MainWindow(QMainWindow):
             "created_at": meta.get("created_at", ""),
             "experiment": {
                 "path": exp_meta.get("path") or self._mat_to_string(input_mat, "source_path", ""),
-                "file_name": exp_meta.get("file_name") or self._mat_to_string(input_mat, "file_name", "loaded experiment"),
+                "file_name": self._clean_imported_experiment_name(
+                    exp_meta.get("file_name") or self._mat_to_string(input_mat, "file_name", "loaded experiment")
+                ),
                 "t": t_exp,
                 "R": R_exp,
                 "P_inf": p_inf,
@@ -4136,13 +4452,20 @@ class MainWindow(QMainWindow):
         if n_points < 3:
             return None, n_points, "simulation LSQErr window contains fewer than 3 points"
 
+        t_sim = np.asarray(out.t_sim, dtype=float)
+        R_sim = np.asarray(out.R_sim, dtype=float)
+        covered = (t_windowed >= float(t_sim[0])) & (t_windowed <= float(t_sim[-1]))
+        t_windowed = t_windowed[covered]
+        R_windowed = R_windowed[covered]
+        n_points = int(t_windowed.size)
+        if n_points < 3:
+            return None, n_points, "simulation does not cover enough points in the LSQErr window"
+
         try:
             R_sim_interp = np.interp(
                 t_windowed,
-                np.asarray(out.t_sim, dtype=float),
-                np.asarray(out.R_sim, dtype=float),
-                left=float(out.R_sim[0]),
-                right=float(out.R_sim[-1]),
+                t_sim,
+                R_sim,
             )
         except Exception as exc:
             return None, n_points, f"simulation LSQErr interpolation failed: {exc}"
@@ -4502,6 +4825,16 @@ class MainWindow(QMainWindow):
                 export["t_nondim_exp"] = col(t_exp / tc_gui)
                 export["R_nondim_exp"] = col(R_exp / Rmax_exp)
                 export["Rmax_exp"]     = float(Rmax_exp)
+                t0, t1, cycles = self._current_fit_window_seconds(
+                    t_exp, R_exp, self._get_active_model_key()
+                )
+                export["fit_window_mode"] = (
+                    "auto_cycles" if self.chk_fit_window_cycles.isChecked() else "manual"
+                )
+                export["fit_window_cycles"] = np.nan if cycles is None else int(cycles)
+                export["fit_window_t_start_s"] = float(t0)
+                export["fit_window_t_end_s"] = float(t1)
+                export["fit_window_n_points"] = int(np.count_nonzero((t_exp >= t0) & (t_exp <= t1)))
 
             # --- parameters (same struct format as Save parameters) ---
             names  = list(self._param_rows.keys())
@@ -4532,6 +4865,9 @@ class MainWindow(QMainWindow):
             export["gamma"]     = float(self.spin_gamma.value())
             export["Req"]       = float(self.spin_Req_um.value()) * 1e-6
             export["model_key"] = self._get_active_model_key()
+            optimizer = asdict(self._opt_config)
+            export["optimizer_json"] = json.dumps(self._json_safe(optimizer), ensure_ascii=False)
+            export["optimizer_method"] = str(self._opt_config.method)
 
             savemat(path, export)
             self.statusBar().showMessage(f"Result exported to {path}")

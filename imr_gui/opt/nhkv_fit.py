@@ -171,16 +171,21 @@ def _eval_and_sim(
     if t_sim.size < 3 or R_sim.size < 3:
         return 1e10, None
 
+    covered = (t_exp >= float(t_sim[0])) & (t_exp <= float(t_sim[-1]))
+    if int(np.count_nonzero(covered)) < 3:
+        return 1e10, out
+    t_eval = t_exp[covered]
+    R_eval = R_exp[covered]
+
     try:
-        R_sim_interp = np.interp(t_exp, t_sim, R_sim,
-                                 left=R_sim[0], right=R_sim[-1])
+        R_sim_interp = np.interp(t_eval, t_sim, R_sim)
     except Exception:
         return 1e10, None
 
     # Mean squared error in µm² — dividing by n makes it comparable across
     # experiments with different data densities.
-    n = max(t_exp.size, 1)
-    err = float(np.sum(((R_exp - R_sim_interp) * 1e6) ** 2) / n)
+    n = max(t_eval.size, 1)
+    err = float(np.sum(((R_eval - R_sim_interp) * 1e6) ** 2) / n)
     return (err if np.isfinite(err) else 1e10), out
 
 
@@ -228,12 +233,17 @@ class _DEObjFn:
         t_sim, R_sim = out.t_sim, out.R_sim
         if t_sim.size < 3 or R_sim.size < 3:
             return 1e10
+        covered = (t_exp >= float(t_sim[0])) & (t_exp <= float(t_sim[-1]))
+        if int(np.count_nonzero(covered)) < 3:
+            return 1e10
+        t_eval = t_exp[covered]
+        R_eval = R_exp[covered]
         try:
-            R_interp = np.interp(t_exp, t_sim, R_sim, left=R_sim[0], right=R_sim[-1])
+            R_interp = np.interp(t_eval, t_sim, R_sim)
         except Exception:
             return 1e10
-        n = max(t_exp.size, 1)
-        err = float(np.sum(((R_exp - R_interp) * 1e6) ** 2) / n)
+        n = max(t_eval.size, 1)
+        err = float(np.sum(((R_eval - R_interp) * 1e6) ** 2) / n)
         return err if np.isfinite(err) else 1e10
 
 
