@@ -1,8 +1,17 @@
-numpy>=1.26
-scipy>=1.11
-matplotlib>=3.8
-PySide6>=6.6
-mat73>=0.65
+# IMR Fitting GUI beta 1.2
+#
+# Recommended install:
+#   python -m venv .venv
+#   .\.venv\Scripts\activate
+#   python -m pip install --upgrade pip
+#   pip install -r requirements.txt
 
-# Optional: CMA-ES algorithm (pip install cma)
-# cma>=3.3
+numpy>=1.26,<2.1
+scipy>=1.11,<1.14
+matplotlib>=3.8,<3.10
+PySide6>=6.6,<6.11
+mat73>=0.65,<1.0
+
+# Optional: enables the CMA-ES optimizer in Settings -> Optimizer Settings.
+# Install manually only if needed:
+#   pip install cma>=3.3,<4

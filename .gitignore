@@ -1,4 +1,7 @@
 .vscode/
+.venv/
+venv/
+env/
 __pycache__/
 *.pyc
 需求*.txt

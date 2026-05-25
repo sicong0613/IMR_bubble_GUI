@@ -1,6 +1,6 @@
 # IMR Fitting GUI
 
-**Beta 1.1**
+**Beta 1.2**
 
 A Python desktop application for inertial microrheology (IMR) bubble simulation and parameter fitting, replacing the original MATLAB `patternsearch + IMR` workflow.
 
@@ -44,44 +44,151 @@ A Python desktop application for inertial microrheology (IMR) bubble simulation 
 
 - **Plot controls** — zoom, time window, normalization toggle (R/Req), experimental data overlay.
 
+- **Curve View panel** - compare many imported experiment/simulation curves at once, edit legends, line widths, visibility, curve order, and batch-apply either high-contrast distinct colors or parameter-sweep gradient colors.
+
 - **Auto ODE tolerance** — switching to GMOD1/GMOD2 automatically sets `rtol = atol = 1e-9` (required for accurate resolution of the stiff Maxwell branch); switching to NHKV uses `1e-8 / 1e-7`.
 
 ---
 
 ## Requirements
 
-- Python 3.10 or newer (tested on 3.11)
-- See [requirements.txt](requirements.txt)
+- Python 3.11 is recommended.
+- Do not install the GUI into a shared/global Python environment unless you are deliberately maintaining that environment.
+- Recommended dependency entry points:
+  - `requirements.txt` for a local `venv` environment.
+  - `environment.yml` for Anaconda/Miniconda users.
 
 ---
 
 ## Installation
 
-```bash
+### Option A: Python venv on Windows (recommended)
+
+If the project folder is inside OneDrive or another sync service, create the virtual environment outside the synced folder. For example:
+
+```powershell
+py -3.11 -m venv C:\venvs\imr-gui
+C:\venvs\imr-gui\Scripts\activate
+cd "path\to\IMR_bubble_GUI"
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-For CMA-ES support (optional):
+If the project is not in a synced folder, a project-local `.venv` also works:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Then run:
+
+```powershell
+python main.py
+```
+
+or:
+
+```powershell
+python -m imr_gui
+```
+
+After the `C:\venvs\imr-gui` environment is created, Windows users can also start the GUI by double-clicking:
+
+```text
+run_imr_gui.bat
+```
+
+The batch file expects the virtual environment at `C:\venvs\imr-gui`.
+
+### Option B: Python venv on macOS
+
+Install Python 3.11 first, for example from python.org or Homebrew. If using Homebrew:
 
 ```bash
-pip install cma
+brew install python@3.11
+```
+
+Create the virtual environment outside synced folders such as OneDrive, iCloud Drive, or Dropbox:
+
+```bash
+python3.11 -m venv ~/venvs/imr-gui
+source ~/venvs/imr-gui/bin/activate
+cd /path/to/IMR_bubble_GUI
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python main.py
+```
+
+For later runs:
+
+```bash
+source ~/venvs/imr-gui/bin/activate
+cd /path/to/IMR_bubble_GUI
+python main.py
+```
+
+### Option C: Conda / Anaconda
+
+From the repository root:
+
+```powershell
+conda env create -f environment.yml
+conda activate imr-fitting-gui
+python main.py
+```
+
+### Optional CMA-ES optimizer
+
+The CMA-ES optimizer is optional. Install it only if you plan to use the CMA-ES method:
+
+```powershell
+pip install "cma>=3.3,<4"
+```
+
+For conda users, install it after activating the environment:
+
+```powershell
+conda activate imr-fitting-gui
+pip install "cma>=3.3,<4"
 ```
 
 ---
 
 ## Running
 
-```bash
+On Windows, if you used the recommended `C:\venvs\imr-gui` environment, run:
+
+```powershell
+.\run_imr_gui.bat
+```
+
+Otherwise, activate the project environment first, then run either:
+
+```powershell
+python main.py
+```
+
+or:
+
+```powershell
 python -m imr_gui
 ```
 
-On Windows with multiple Python versions installed:
+The main window title should read `IMR Fitting GUI (beta 1.2)`.
 
-```bash
-py -3.11 -m imr_gui
-```
+---
 
-The main window title should read `IMR Fitting GUI (beta 1.1)`.
+## Environment Notes
+
+- `.venv/`, `venv/`, and `env/` are ignored by git.
+- Git ignore rules do not stop OneDrive from syncing virtual environments. If this repository is in OneDrive, keep the venv in a local folder such as `C:\venvs\imr-gui`.
+- On Windows, `run_imr_gui.bat` is a convenience launcher for the recommended `C:\venvs\imr-gui` environment.
+- `requirements.txt` intentionally pins dependency ranges rather than using unbounded latest versions; GUI libraries such as PySide6 and Matplotlib can change behavior across major/minor releases.
+- `environment.yml` is provided for users who prefer Anaconda/Miniconda, but the lightweight `venv` workflow is the primary development path.
+- Future PyInstaller builds should be created from a clean virtual environment, not from a global Python installation.
 
 ---
 
@@ -90,6 +197,66 @@ The main window title should read `IMR Fitting GUI (beta 1.1)`.
 File → Load experiment data (.mat)
 
 Expects a `.mat` file with 1-D arrays named `t` (seconds) and `R` (meters). Falls back to positional detection if exact names are not found. Time is automatically shifted so that the interpolated R-peak sits at t = 0.
+
+---
+
+## Curve View and Color Palettes
+
+Open the multi-curve comparison panel from:
+
+```text
+View -> Curve Selection Panel
+```
+
+Enable `Enable multiple curve selection`, then use `Batch import curves` to add experiment or simulation result `.mat` files. If a MAT file contains a top-level `legend` field, it is used as the curve legend. LaTeX-style Greek names such as `\alpha` are displayed as Unicode Greek letters in the GUI.
+
+The Curve View panel supports:
+
+- show/hide curves without deleting them
+- row selection with Ctrl/Shift multi-select
+- `Clear selected`, `Clear all`
+- `Move to top`, `Move up`, `Move down`
+- legend editing, type switching, color selection, and line-width editing
+
+Color assignment is explicit:
+
+1. Import curves.
+2. Choose `Color mode`.
+3. Click `Apply colors`.
+
+Available color modes:
+
+- `Distinct`: high-contrast colors for a small number of curves.
+- `Sweep gradient`: parameter-sweep colors, mapped by the current curve row order.
+
+If rows are selected, `Apply colors` only recolors selected rows. If no rows are selected, it recolors all curves. This makes it possible to reorder curves first, then apply a sweep gradient in the desired parameter direction.
+
+Color presets live in:
+
+```text
+imr_gui/view_colors.json
+```
+
+Each entry can define:
+
+```json
+{"name": "Blue", "color": "#0072BD", "role": "sim", "palette": "distinct"}
+```
+
+Fields:
+
+- `name`: display name / tooltip.
+- `color`: hex RGB color.
+- `role`: `sim`, `exp`, or `both`.
+- `palette`: `distinct`, `sweep`, or `both`.
+
+The default `view_colors.json` includes high-contrast distinct colors and a 20-color sweep gradient. If the number of curves does not match the number of sweep colors, the GUI interpolates along the sweep palette.
+
+Curve View exports are under the `View` menu:
+
+- `Export view (.mat)`: exports curve data and style metadata.
+- `Export view (.svg)`: exports a vector figure.
+- `Copy view (png)` / `Copy view (svg)`: copies the current preview to the clipboard.
 
 ---
 

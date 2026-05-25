@@ -1,0 +1,14 @@
+name: imr-fitting-gui
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.26,<2.1
+  - scipy>=1.11,<1.14
+  - matplotlib>=3.8,<3.10
+  - pyside6>=6.6,<6.11
+  - pip
+  - pip:
+      - mat73>=0.65,<1.0
+      # Optional CMA-ES optimizer:
+      # - cma>=3.3,<4

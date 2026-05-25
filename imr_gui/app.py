@@ -22,15 +22,17 @@ try:
     _HAS_MAT73 = True
 except ImportError:
     _HAS_MAT73 = False
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QActionGroup, QColor, QPen, QValidator
+from PySide6.QtCore import QByteArray, QEvent, QMimeData, Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QActionGroup, QColor, QImage, QPen, QValidator
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
     QAbstractItemView,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QDockWidget,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -70,7 +72,7 @@ from imr_gui.imr import NhkvRmaxInputs, simulate_nhkv_rmax_lic
 from imr_gui.imr import GMODInputs, simulate_gmod_lic
 from imr_gui.imr import GMOD1Inputs, simulate_gmod1_lic
 from imr_gui.io import load_experiment_mat, find_rmax_value
-from imr_gui.ui.mpl_canvas import MplCanvas
+from imr_gui.ui.mpl_canvas import MplCanvas, PlotHandles
 from imr_gui.constitutive import (
     load_nhkv_model,
     ConstitutiveParameter, ConstitutiveModel, load_available_models,
@@ -200,6 +202,69 @@ class _JobRowDelegate(QStyledItemDelegate):
         if col == last_col:
             painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
         painter.restore()
+
+
+class _ColumnResizeHandle(QFrame):
+    dragged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(5)
+        self.setFixedHeight(24)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+        self.setFrameShape(QFrame.Shape.VLine)
+        self.setStyleSheet("QFrame { color: #3f3f3f; }")
+        self._last_x: int | None = None
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._last_x = int(event.globalPosition().x())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._last_x is None:
+            super().mouseMoveEvent(event)
+            return
+        x = int(event.globalPosition().x())
+        delta = x - self._last_x
+        if delta:
+            self.dragged.emit(delta)
+            self._last_x = x
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self._last_x = None
+        event.accept()
+
+
+class _ColorSwatchDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):  # noqa: N802
+        data = index.data(Qt.ItemDataRole.UserRole)
+        if data == "__more__":
+            super().paint(painter, option, index)
+            return
+        color = QColor(str(data))
+        if not color.isValid():
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect, option.palette.highlight())
+        rect = option.rect.adjusted(4, 3, -4, -3)
+        painter.fillRect(rect, color)
+        painter.setPen(QPen(QColor("#000000"), 1))
+        painter.drawRect(rect)
+        painter.restore()
+
+    def sizeHint(self, option, index):  # noqa: N802
+        size = super().sizeHint(option, index)
+        data = index.data(Qt.ItemDataRole.UserRole)
+        if data != "__more__":
+            size.setHeight(max(size.height(), 24))
+        return size
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +491,7 @@ class FitWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    APP_TITLE = "IMR Fitting GUI (beta 1.1)"
+    APP_TITLE = "IMR Fitting GUI (beta 1.2)"
     PARAM_INHERIT_ALIASES: dict[str, dict[str, str]] = {
         "GMOD1": {
             "GA": "GA1",
@@ -491,9 +556,16 @@ class MainWindow(QMainWindow):
         self._loading_job_to_editor: bool = False
         self._model_param_memory: dict[str, dict] = {}
         self._available_models = load_available_models()
+        self._multi_curve_enabled: bool = False
+        self._view_curves: list[dict] = []
+        self._view_color_presets: list[dict] = self._load_view_color_presets()
+        self._curve_color_mode: str = "distinct"
+        self._selected_curve_indices: set[int] = set()
+        self._curve_selection_anchor: int | None = None
 
         self._build_menu()
         self._build_ui()
+        self._build_curve_view_dock()
         self._load_settings()
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
@@ -567,6 +639,20 @@ class MainWindow(QMainWindow):
         act_opt_settings.triggered.connect(self._show_optimizer_settings)
         act_job_settings = settings_menu.addAction("Job List Settings...")
         act_job_settings.triggered.connect(self._show_job_settings)
+
+        view_menu = self.menuBar().addMenu("View")
+        self._act_curve_view = view_menu.addAction("Curve Selection Panel")
+        self._act_curve_view.setCheckable(True)
+        self._act_curve_view.triggered.connect(self._toggle_curve_view_panel)
+        view_menu.addSeparator()
+        self._act_export_view_mat = view_menu.addAction("Export view (.mat)")
+        self._act_export_view_mat.triggered.connect(self._on_export_view_mat)
+        self._act_export_view_svg = view_menu.addAction("Export view (.svg)")
+        self._act_export_view_svg.triggered.connect(self._on_export_view_svg)
+        self._act_copy_view_png = view_menu.addAction("Copy view (png)")
+        self._act_copy_view_png.triggered.connect(self._on_copy_view_png)
+        self._act_copy_view_svg = view_menu.addAction("Copy view (svg)")
+        self._act_copy_view_svg.triggered.connect(self._on_copy_view_svg)
 
     # =====================================================================
     # UI build
@@ -769,7 +855,7 @@ class MainWindow(QMainWindow):
         )
         fw_lay.addWidget(self.chk_fit_window_cycles)
         self.spin_fit_window_cycles = QSpinBox()
-        self.spin_fit_window_cycles.setRange(1, 20)
+        self.spin_fit_window_cycles.setRange(0, 20)
         self.spin_fit_window_cycles.setValue(1)
         self.spin_fit_window_cycles.setToolTip("Number of collapse cycles to include.")
         fw_lay.addWidget(self.spin_fit_window_cycles)
@@ -851,11 +937,1115 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(root)
         layout.addWidget(splitter)
 
-        self._update_view_buttons()
-
         # populate initial model
         self._on_model_changed(self._cmb_model.currentText())
         self._cmb_model.currentTextChanged.connect(self._on_model_changed)
+
+        self._update_view_buttons()
+
+    def _view_colors_path(self) -> Path:
+        return Path(__file__).parent / "view_colors.json"
+
+    def _load_view_color_presets(self) -> list[dict]:
+        default = [
+            {"name": "Blue", "color": "#1f77b4", "role": "sim", "palette": "distinct"},
+            {"name": "Orange", "color": "#ff7f0e", "role": "sim", "palette": "distinct"},
+            {"name": "Green", "color": "#2ca02c", "role": "exp", "palette": "distinct"},
+            {"name": "Red", "color": "#d62728", "role": "exp", "palette": "distinct"},
+            {"name": "Purple", "color": "#9467bd", "role": "sim", "palette": "distinct"},
+            {"name": "Brown", "color": "#8c564b", "role": "sim", "palette": "distinct"},
+            {"name": "Pink", "color": "#e377c2", "role": "exp", "palette": "distinct"},
+            {"name": "Gray", "color": "#7f7f7f", "role": "exp", "palette": "distinct"},
+            {"name": "Olive", "color": "#bcbd22", "role": "sim", "palette": "distinct"},
+            {"name": "Cyan", "color": "#17becf", "role": "sim", "palette": "distinct"},
+            {"name": "Black", "color": "#000000", "role": "exp", "palette": "distinct"},
+        ]
+        path = self._view_colors_path()
+        if not path.exists():
+            return default
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+        presets: list[dict] = []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                color = str(item.get("color", "")).strip()
+                if not name or not QColor(color).isValid():
+                    continue
+                role = str(
+                    item.get("role", item.get("type", item.get("curve_type", "both")))
+                ).strip().lower()
+                if role in ("experiment", "experimental"):
+                    role = "exp"
+                elif role in ("simulation", "fit"):
+                    role = "sim"
+                if role not in ("exp", "sim", "both", ""):
+                    role = "both"
+                palette = str(item.get("palette", "distinct")).strip().lower()
+                if palette in ("gradient", "sweep_gradient", "sweep-gradient"):
+                    palette = "sweep"
+                if palette not in ("distinct", "sweep", "both", ""):
+                    palette = "distinct"
+                presets.append({
+                    "name": name,
+                    "color": QColor(color).name(),
+                    "role": role or "both",
+                    "palette": palette or "distinct",
+                })
+        return presets or default
+
+    def _build_curve_view_dock(self):
+        self._curve_view_dock = QDockWidget("Curve View", self)
+        self._curve_view_dock.setObjectName("CurveViewDock")
+        self._curve_view_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        self.chk_multi_curve = QCheckBox("Enable multiple curve selection")
+        self.chk_multi_curve.setChecked(False)
+        self.chk_multi_curve.toggled.connect(self._on_multi_curve_toggled)
+        lay.addWidget(self.chk_multi_curve)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color mode:"))
+        self.cmb_curve_color_mode = _NoWheelComboBox()
+        self.cmb_curve_color_mode.addItem("Distinct", "distinct")
+        self.cmb_curve_color_mode.addItem("Sweep gradient", "sweep")
+        self.cmb_curve_color_mode.setToolTip(
+            "Distinct uses high-contrast colors. Sweep gradient maps curve order to a parameter-sweep color ramp."
+        )
+        self.cmb_curve_color_mode.currentIndexChanged.connect(self._on_curve_color_mode_changed)
+        color_row.addWidget(self.cmb_curve_color_mode)
+        self.btn_apply_curve_colors = QPushButton("Apply colors")
+        self.btn_apply_curve_colors.setToolTip(
+            "Apply the selected color mode to selected curves, or to all curves if no rows are selected."
+        )
+        self.btn_apply_curve_colors.clicked.connect(self._on_apply_curve_colors)
+        color_row.addWidget(self.btn_apply_curve_colors)
+        color_row.addStretch(1)
+        lay.addLayout(color_row)
+
+        self._curve_col_widths = {0: 28, 1: 81, 2: 121, 3: 72, 4: 90}
+        self._curve_col_min_widths = {0: 28, 1: 28, 2: 64, 3: 28, 4: 35}
+        self._curve_row_widgets: list[list[QWidget]] = []
+
+        self._curve_scroll = QScrollArea()
+        self._curve_scroll.setWidgetResizable(True)
+        self._curve_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._curve_scroll.setMinimumWidth(420)
+        self._curve_scroll.viewport().installEventFilter(self)
+        self._curve_grid_host = QWidget()
+        self._curve_grid = QGridLayout(self._curve_grid_host)
+        self._curve_grid.setContentsMargins(0, 0, 0, 0)
+        self._curve_grid.setHorizontalSpacing(3)
+        self._curve_grid.setVerticalSpacing(4)
+        self._curve_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._curve_grid.setRowStretch(999, 1)
+        self._build_curve_grid_header()
+        self._curve_scroll.setWidget(self._curve_grid_host)
+        lay.addWidget(self._curve_scroll, stretch=1)
+
+        btn_row = QHBoxLayout()
+        self.btn_import_curves = QPushButton("Batch import curves")
+        self.btn_import_curves.clicked.connect(self._on_batch_import_curves)
+        btn_row.addWidget(self.btn_import_curves)
+        self.btn_clear_selected_curves = QPushButton("Clear selected")
+        self.btn_clear_selected_curves.setEnabled(False)
+        self.btn_clear_selected_curves.clicked.connect(self._on_clear_selected_view_curve)
+        btn_row.addWidget(self.btn_clear_selected_curves)
+        self.btn_clear_curves = QPushButton("Clear all")
+        self.btn_clear_curves.setEnabled(False)
+        self.btn_clear_curves.clicked.connect(self._on_clear_view_curves)
+        btn_row.addWidget(self.btn_clear_curves)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+        move_row = QHBoxLayout()
+        self.btn_curve_move_top = QPushButton("Move to top")
+        self.btn_curve_move_top.setEnabled(False)
+        self.btn_curve_move_top.clicked.connect(self._on_move_selected_curves_to_top)
+        move_row.addWidget(self.btn_curve_move_top)
+        self.btn_curve_move_up = QPushButton("Move up")
+        self.btn_curve_move_up.setEnabled(False)
+        self.btn_curve_move_up.clicked.connect(self._on_move_selected_curves_up)
+        move_row.addWidget(self.btn_curve_move_up)
+        self.btn_curve_move_down = QPushButton("Move down")
+        self.btn_curve_move_down.setEnabled(False)
+        self.btn_curve_move_down.clicked.connect(self._on_move_selected_curves_down)
+        move_row.addWidget(self.btn_curve_move_down)
+        move_row.addStretch(1)
+        lay.addLayout(move_row)
+
+        self._curve_view_dock.setWidget(panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._curve_view_dock)
+        self._curve_view_dock.setFloating(True)
+        self._curve_view_dock.resize(560, 420)
+        self._curve_view_dock.hide()
+        self._curve_view_dock.visibilityChanged.connect(self._on_curve_view_visibility_changed)
+
+    def _toggle_curve_view_panel(self, checked: bool):
+        if checked:
+            self._curve_view_dock.setFloating(True)
+        self._curve_view_dock.setVisible(bool(checked))
+
+    def _on_curve_view_visibility_changed(self, visible: bool):
+        if hasattr(self, "_act_curve_view"):
+            self._act_curve_view.setChecked(bool(visible))
+
+    def _on_multi_curve_toggled(self, checked: bool):
+        self._multi_curve_enabled = bool(checked)
+        if checked:
+            self._seed_view_curves_from_current_canvas()
+        self.statusBar().showMessage(
+            "Multiple curve selection enabled" if checked else "Multiple curve selection disabled"
+        )
+        self._redraw_all()
+
+    def _on_curve_color_mode_changed(self, _index: int):
+        if hasattr(self, "cmb_curve_color_mode"):
+            self._curve_color_mode = str(self.cmb_curve_color_mode.currentData() or "distinct")
+
+    def _curve_view_active(self) -> bool:
+        return (
+            bool(getattr(self, "_multi_curve_enabled", False))
+            and hasattr(self, "_curve_view_dock")
+            and self._curve_view_dock.isVisible()
+        )
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if (
+            hasattr(self, "_curve_scroll")
+            and obj is self._curve_scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            QTimer.singleShot(0, self._fit_curve_columns_to_view)
+        if event.type() == QEvent.Type.MouseButtonPress:
+            row = obj.property("curve_row") if hasattr(obj, "property") else None
+            if row is not None:
+                try:
+                    col = obj.property("curve_col") if hasattr(obj, "property") else None
+                    if int(col) == 0:
+                        if isinstance(obj, QCheckBox):
+                            obj.setChecked(not obj.isChecked())
+                        return True
+                    self._select_view_curve_row(int(row), event.modifiers())
+                except Exception:
+                    pass
+        return super().eventFilter(obj, event)
+
+    def _curve_grid_col(self, logical_col: int) -> int:
+        mapping = {0: 0, 1: 2, 2: 4, 3: 6, 4: 8}
+        return mapping.get(logical_col, logical_col * 2)
+
+    def _build_curve_grid_header(self):
+        for col in range(12):
+            self._curve_grid.setColumnStretch(col, 0)
+        for col, text in enumerate(("Show", "Type", "Legend", "Color", "Width")):
+            label = QLabel(text)
+            label.setStyleSheet("font-weight: 600;")
+            label.setFixedWidth(self._curve_col_widths[col])
+            label.setFixedHeight(24)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            self._curve_grid.addWidget(label, 0, self._curve_grid_col(col))
+            if col < 4:
+                handle = _ColumnResizeHandle()
+                handle.dragged.connect(lambda delta, c=col: self._resize_curve_columns(c, delta))
+                self._curve_grid.addWidget(handle, 0, self._curve_grid_col(col) + 1)
+        self._curve_grid.setColumnStretch(10, 0)
+
+    def _resize_curve_columns(self, left_col: int, delta: int):
+        legend_col = 2
+        color_col = 3
+        widths = self._curve_col_widths
+        mins = self._curve_col_min_widths
+        delta = int(delta)
+
+        # Boundary between Legend and Color: keep total width fixed and trade
+        # space only between those two columns.
+        if left_col == legend_col:
+            legend_new = max(mins[legend_col], widths[legend_col] + delta)
+            actual_delta = legend_new - widths[legend_col]
+            color_new = max(mins[color_col], widths[color_col] - actual_delta)
+            actual_delta = widths[color_col] - color_new
+            widths[legend_col] = widths[legend_col] + actual_delta
+            widths[color_col] = color_new
+            self._apply_curve_column_widths()
+            return
+
+        # Boundary between Color and Width: keep Color fixed and trade width
+        # only between Width and Legend.
+        if left_col == color_col:
+            width_col = 4
+            requested_width = max(mins[width_col], widths[width_col] - delta)
+            requested_delta = requested_width - widths[width_col]
+            requested_legend = max(mins[legend_col], widths[legend_col] - requested_delta)
+            actual_delta = widths[legend_col] - requested_legend
+            widths[width_col] = widths[width_col] + actual_delta
+            widths[legend_col] = requested_legend
+            self._apply_curve_column_widths()
+            return
+
+        # Columns to the right of Legend grow into the spacer before Width.
+        # Once the fixed columns fill the visible panel, stop instead of
+        # pushing Width out and creating horizontal scrolling.
+        if left_col > legend_col:
+            requested = max(mins[left_col], widths[left_col] + delta)
+            if requested > widths[left_col]:
+                requested = min(requested, widths[left_col] + self._curve_available_extra_width())
+            widths[left_col] = requested
+            self._fit_curve_columns_to_view()
+            self._apply_curve_column_widths()
+            return
+
+        # Columns left of Legend also trade space with Legend.
+        left_new = max(mins[left_col], widths[left_col] + delta)
+        actual_delta = left_new - widths[left_col]
+
+        legend_new = max(mins[legend_col], widths[legend_col] - actual_delta)
+        actual_delta = widths[legend_col] - legend_new
+        widths[left_col] = widths[left_col] + actual_delta
+        widths[legend_col] = legend_new
+        self._apply_curve_column_widths()
+
+    def _fit_curve_columns_to_view(self):
+        if not hasattr(self, "_curve_scroll"):
+            return
+        viewport_width = int(self._curve_scroll.viewport().width())
+        if viewport_width <= 0:
+            return
+        legend_col = 2
+        mins = self._curve_col_min_widths
+        chrome = 4 * 5 + 10 * 3 + 12
+        fixed_width = sum(
+            int(width)
+            for col, width in self._curve_col_widths.items()
+            if col != legend_col
+        )
+        self._curve_col_widths[legend_col] = max(
+            mins[legend_col],
+            viewport_width - fixed_width - chrome,
+        )
+        self._apply_curve_column_widths()
+
+    def _resize_width_left_boundary(self, delta: int):
+        legend_col = 2
+        width_col = 4
+        widths = self._curve_col_widths
+        mins = self._curve_col_min_widths
+        delta = int(delta)
+
+        # Move Width's left edge while keeping its right edge anchored.
+        # Drag right: Width shrinks and Legend grows.
+        # Drag left: Width grows and takes space from Legend.
+        requested_width = max(mins[width_col], widths[width_col] - delta)
+        requested_delta = requested_width - widths[width_col]
+        requested_legend = max(mins[legend_col], widths[legend_col] - requested_delta)
+        actual_delta = widths[legend_col] - requested_legend
+        widths[width_col] = widths[width_col] + actual_delta
+        widths[legend_col] = requested_legend
+        self._apply_curve_column_widths()
+
+    def _curve_available_extra_width(self) -> int:
+        if not hasattr(self, "_curve_scroll"):
+            return 0
+        viewport_width = int(self._curve_scroll.viewport().width())
+        if viewport_width <= 0:
+            return 0
+        # Four resize handles plus layout gaps and a little safety margin.
+        chrome = 4 * 5 + 10 * 3 + 16
+        fixed_width = sum(int(v) for v in self._curve_col_widths.values())
+        return max(0, viewport_width - fixed_width - chrome)
+
+    def _apply_curve_column_widths(self):
+        for row_widgets in getattr(self, "_curve_row_widgets", []):
+            for col, widget in enumerate(row_widgets):
+                widget.setFixedWidth(self._curve_col_widths[col])
+        for col in range(5):
+            item = self._curve_grid.itemAtPosition(0, self._curve_grid_col(col))
+            if item and item.widget():
+                item.widget().setFixedWidth(self._curve_col_widths[col])
+
+    @staticmethod
+    def _curve_color_role(curve_type: str) -> str:
+        return "exp" if str(curve_type).lower() == "experiment" else "sim"
+
+    def _ordered_view_color_presets(self, curve_type: str, palette: str | None = None) -> list[dict]:
+        role = self._curve_color_role(curve_type)
+        palette = str(palette or "").lower()
+        presets = list(self._view_color_presets or [{"name": "Blue", "color": "#1f77b4", "role": "both"}])
+        if palette:
+            filtered = [
+                p for p in presets
+                if str(p.get("palette", "distinct")).lower() in (palette, "both", "")
+            ]
+            if filtered:
+                presets = filtered
+        preferred = [p for p in presets if str(p.get("role", "both")).lower() in (role, "both", "")]
+        secondary = [p for p in presets if p not in preferred]
+        return preferred + secondary
+
+    def _make_curve_color_combo(self, color: str = "#1f77b4", curve_type: str = "simulation") -> QComboBox:
+        combo = _NoWheelComboBox()
+        combo.setItemDelegate(_ColorSwatchDelegate(combo))
+        selected_index = -1
+        for i, preset in enumerate(self._ordered_view_color_presets(curve_type)):
+            combo.addItem(" ", preset["color"])
+            combo.setItemData(i, QColor(preset["color"]), Qt.ItemDataRole.BackgroundRole)
+            combo.setItemData(i, QColor("#000000"), Qt.ItemDataRole.ForegroundRole)
+            role = str(preset.get("role", "both"))
+            palette = str(preset.get("palette", "distinct"))
+            combo.setItemData(i, f"{preset['name']} ({role}, {palette})", Qt.ItemDataRole.ToolTipRole)
+            if QColor(preset["color"]).name().lower() == QColor(color).name().lower():
+                selected_index = i
+        combo.addItem("More colors...", "__more__")
+        if selected_index < 0 and QColor(color).isValid():
+            insert_at = max(0, combo.count() - 1)
+            custom = QColor(color).name()
+            combo.insertItem(insert_at, custom.upper(), custom)
+            combo.setItemData(insert_at, QColor(custom), Qt.ItemDataRole.BackgroundRole)
+            combo.setItemData(insert_at, QColor("#000000"), Qt.ItemDataRole.ForegroundRole)
+            combo.setItemData(insert_at, "Current custom color", Qt.ItemDataRole.ToolTipRole)
+            selected_index = insert_at
+        if selected_index >= 0:
+            combo.setCurrentIndex(selected_index)
+        self._refresh_curve_color_combo(combo)
+        return combo
+
+    def _refresh_curve_color_combo(self, combo: QComboBox):
+        data = combo.currentData()
+        if data == "__more__":
+            combo.setStyleSheet("")
+            return
+        color = QColor(str(data))
+        if not color.isValid():
+            combo.setStyleSheet("")
+            return
+        combo.setStyleSheet(
+            "QComboBox {"
+            f" background-color: {color.name()};"
+            " color: transparent;"
+            " border: 2px solid #000;"
+            " padding: 0 14px 0 2px;"
+            " selection-background-color: transparent;"
+            "}"
+            "QComboBox::drop-down {"
+            " border-left: 1px solid #000;"
+            " background: rgba(255, 255, 255, 35);"
+            " width: 14px;"
+            "}"
+            "QComboBox QAbstractItemView {"
+            " border: 1px solid #000;"
+            " outline: 0;"
+            " selection-background-color: rgba(255, 255, 255, 45);"
+            "}"
+        )
+
+    def _next_view_curve_color(self, curve_type: str = "simulation") -> str:
+        presets = self._ordered_view_color_presets(curve_type, palette="distinct")
+        same_type_count = sum(
+            1
+            for curve in self._view_curves
+            if self._curve_color_role(str(curve.get("type", "simulation")))
+            == self._curve_color_role(curve_type)
+        )
+        idx = same_type_count % len(presets)
+        return str(presets[idx].get("color", "#1f77b4"))
+
+    @staticmethod
+    def _interpolate_hex_colors(stops: list[str], count: int) -> list[str]:
+        valid = [QColor(c) for c in stops if QColor(c).isValid()]
+        if count <= 0:
+            return []
+        if not valid:
+            return ["#1f77b4"] * count
+        if count == 1:
+            return [valid[0].name()]
+        if len(valid) == 1:
+            return [valid[0].name()] * count
+        positions = np.linspace(0.0, len(valid) - 1, count)
+        colors: list[str] = []
+        for pos in positions:
+            lo = int(np.floor(pos))
+            hi = min(lo + 1, len(valid) - 1)
+            frac = float(pos - lo)
+            c0 = valid[lo]
+            c1 = valid[hi]
+            r = round(c0.red() + (c1.red() - c0.red()) * frac)
+            g = round(c0.green() + (c1.green() - c0.green()) * frac)
+            b = round(c0.blue() + (c1.blue() - c0.blue()) * frac)
+            colors.append(QColor(r, g, b).name())
+        return colors
+
+    def _colors_for_curve_targets(self, target_indices: list[int], palette: str) -> list[str]:
+        if not target_indices:
+            return []
+        if palette == "sweep":
+            presets = self._ordered_view_color_presets("simulation", palette="sweep")
+            stops = [str(p.get("color", "#1f77b4")) for p in presets]
+            return self._interpolate_hex_colors(stops, len(target_indices))
+
+        colors: list[str] = []
+        counters = {"experiment": 0, "simulation": 0}
+        for idx in target_indices:
+            curve_type = str(self._view_curves[idx].get("type", "simulation"))
+            presets = self._ordered_view_color_presets(curve_type, palette="distinct")
+            key = "experiment" if curve_type == "experiment" else "simulation"
+            preset = presets[counters[key] % len(presets)]
+            colors.append(str(preset.get("color", "#1f77b4")))
+            counters[key] += 1
+        return colors
+
+    def _on_apply_curve_colors(self):
+        if not self._view_curves:
+            return
+        palette = str(getattr(self, "_curve_color_mode", "distinct") or "distinct")
+        if hasattr(self, "cmb_curve_color_mode"):
+            palette = str(self.cmb_curve_color_mode.currentData() or palette)
+            self._curve_color_mode = palette
+        targets = self._selected_curve_index_list()
+        if not targets:
+            targets = list(range(len(self._view_curves)))
+        colors = self._colors_for_curve_targets(targets, palette)
+        for idx, color in zip(targets, colors):
+            self._view_curves[idx]["color"] = color
+        self._rebuild_curve_rows()
+        self.statusBar().showMessage(
+            f"Applied {'sweep gradient' if palette == 'sweep' else 'distinct'} colors to {len(targets)} curve(s)."
+        )
+
+    @staticmethod
+    def _normalise_legend_text(text: str) -> str:
+        replacements = {
+            r"\alpha": "α",
+            r"\beta": "β",
+            r"\gamma": "γ",
+            r"\delta": "δ",
+            r"\epsilon": "ε",
+            r"\varepsilon": "ε",
+            r"\zeta": "ζ",
+            r"\eta": "η",
+            r"\theta": "θ",
+            r"\vartheta": "θ",
+            r"\iota": "ι",
+            r"\kappa": "κ",
+            r"\lambda": "λ",
+            r"\mu": "μ",
+            r"\nu": "ν",
+            r"\xi": "ξ",
+            r"\pi": "π",
+            r"\rho": "ρ",
+            r"\sigma": "σ",
+            r"\tau": "τ",
+            r"\upsilon": "υ",
+            r"\phi": "φ",
+            r"\varphi": "φ",
+            r"\chi": "χ",
+            r"\psi": "ψ",
+            r"\omega": "ω",
+            r"\Gamma": "Γ",
+            r"\Delta": "Δ",
+            r"\Theta": "Θ",
+            r"\Lambda": "Λ",
+            r"\Xi": "Ξ",
+            r"\Pi": "Π",
+            r"\Sigma": "Σ",
+            r"\Phi": "Φ",
+            r"\Psi": "Ψ",
+            r"\Omega": "Ω",
+        }
+        out = str(text or "")
+        out = out.replace("$", "")
+        for src, dst in replacements.items():
+            out = out.replace(src, dst)
+        return out
+
+    def _curve_legend_from_mat(self, mat: dict, default: str) -> str:
+        legend = self._mat_to_string(mat, "legend", "").strip()
+        if not legend:
+            legend = default
+        return self._normalise_legend_text(legend)
+
+    @staticmethod
+    def _infer_curve_type(t: np.ndarray, R: np.ndarray) -> str:
+        t_arr = np.asarray(t, dtype=float).reshape(-1)
+        R_arr = np.asarray(R, dtype=float).reshape(-1)
+        n = min(t_arr.size, R_arr.size)
+        if n >= 4:
+            t_sorted = np.sort(t_arr[:n])
+            dt = np.diff(t_sorted)
+            dt = dt[np.isfinite(dt) & (dt > 0)]
+            if dt.size:
+                median_dt = float(np.median(dt))
+                # Fastest expected experiment is about 10M fps, i.e. 0.1 us.
+                # Anything meaningfully denser is treated as simulation/fit.
+                if median_dt < 1.0e-7:
+                    return "simulation"
+            span = float(np.nanmax(t_arr[:n]) - np.nanmin(t_arr[:n]))
+            if np.isfinite(span) and span > 0 and n >= 20000:
+                return "simulation"
+        return "experiment"
+
+    def _seed_view_curves_from_current_canvas(self):
+        if self._view_curves:
+            return
+        if self.state.exp_t is not None and self.state.exp_R is not None:
+            name = Path(self.state.exp_path).stem if self.state.exp_path else "exp data"
+            self._add_curve_to_view(
+                curve_type="experiment",
+                t=self.state.exp_t,
+                R=self.state.exp_R,
+                legend=name,
+                redraw=False,
+            )
+        if self.state.sim_t is not None and self.state.sim_R is not None:
+            self._add_curve_to_view(
+                curve_type="simulation",
+                t=self.state.sim_t,
+                R=self.state.sim_R,
+                legend=f"{self._get_active_model_key()} simulation",
+                meta=self.state.sim_meta,
+                redraw=False,
+            )
+
+    def _add_curve_to_view(
+        self,
+        *,
+        curve_type: str,
+        t: np.ndarray,
+        R: np.ndarray,
+        legend: str,
+        meta: dict | None = None,
+        redraw: bool = True,
+    ):
+        t_arr = np.asarray(t, dtype=float).reshape(-1)
+        R_arr = np.asarray(R, dtype=float).reshape(-1)
+        n = min(t_arr.size, R_arr.size)
+        if n <= 0:
+            return
+        if curve_type == "auto":
+            curve_type = self._infer_curve_type(t_arr[:n], R_arr[:n])
+        curve = {
+            "visible": True,
+            "type": "experiment" if curve_type == "experiment" else "simulation",
+            "legend": self._normalise_legend_text(legend),
+            "color": self._next_view_curve_color(curve_type),
+            "width": 1.5,
+            "t": t_arr[:n].copy(),
+            "R": R_arr[:n].copy(),
+            "meta": dict(meta or {}),
+        }
+        self._add_view_curve_row(curve)
+        if redraw:
+            self._redraw_all()
+
+    def _apply_curve_row_selection_style(self):
+        for i, row_widgets in enumerate(self._curve_row_widgets):
+            style = "background: rgba(80, 140, 220, 50);" if i in self._selected_curve_indices else ""
+            for col, widget in enumerate(row_widgets):
+                if col == 3:
+                    self._refresh_curve_color_combo(widget)
+                    continue
+                widget.setStyleSheet(style)
+        self._update_curve_selection_buttons()
+
+    def _update_curve_selection_buttons(self):
+        has_selection = bool(self._selected_curve_indices)
+        self.btn_clear_selected_curves.setEnabled(has_selection)
+        if hasattr(self, "btn_curve_move_top"):
+            self.btn_curve_move_top.setEnabled(has_selection)
+            self.btn_curve_move_up.setEnabled(has_selection)
+            self.btn_curve_move_down.setEnabled(has_selection)
+
+    def _select_view_curve_row(self, row_index: int, modifiers=Qt.KeyboardModifier.NoModifier):
+        if not (0 <= row_index < len(self._view_curves)):
+            return
+        mods = Qt.KeyboardModifiers(modifiers)
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            anchor = self._curve_selection_anchor
+            if anchor is None or not (0 <= anchor < len(self._view_curves)):
+                anchor = row_index
+            start, end = sorted((anchor, row_index))
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                self._selected_curve_indices.update(range(start, end + 1))
+            else:
+                self._selected_curve_indices = set(range(start, end + 1))
+        elif mods & Qt.KeyboardModifier.ControlModifier:
+            if row_index in self._selected_curve_indices:
+                self._selected_curve_indices.remove(row_index)
+            else:
+                self._selected_curve_indices.add(row_index)
+            self._curve_selection_anchor = row_index
+        else:
+            self._selected_curve_indices = {row_index}
+            self._curve_selection_anchor = row_index
+        self._apply_curve_row_selection_style()
+
+    def _add_view_curve_row(self, curve: dict):
+        row_index = len(self._view_curves)
+        row = row_index + 1
+        self._view_curves.append(curve)
+
+        chk_show = QCheckBox()
+        chk_show.setChecked(bool(curve.get("visible", True)))
+        chk_show.setToolTip("Show or hide this curve in the preview.")
+        chk_show.setFixedWidth(self._curve_col_widths[0])
+        self._curve_grid.addWidget(chk_show, row, self._curve_grid_col(0))
+
+        cmb_type = _NoWheelComboBox()
+        cmb_type.addItem("······", "experiment")
+        cmb_type.addItem("━━━━", "simulation")
+        curve_type = str(curve.get("type", "simulation")).lower()
+        cmb_type.setCurrentIndex(0 if curve_type == "experiment" else 1)
+        cmb_type.setToolTip("Curve style. Dots use markers; line uses a solid curve.")
+        cmb_type.setEditable(False)
+        cmb_type.setFixedWidth(self._curve_col_widths[1])
+        self._curve_grid.addWidget(cmb_type, row, self._curve_grid_col(1))
+
+        le_legend = QLineEdit(str(curve.get("legend", f"curve {row}")))
+        le_legend.setToolTip("Legend label shown in the preview.")
+        le_legend.setFixedWidth(self._curve_col_widths[2])
+        self._curve_grid.addWidget(le_legend, row, self._curve_grid_col(2))
+
+        cmb_color = self._make_curve_color_combo(
+            str(curve.get("color", "#1f77b4")),
+            str(curve.get("type", "simulation")),
+        )
+        cmb_color.setToolTip("Curve color. Choose More colors... for a custom color.")
+        cmb_color.setFixedWidth(self._curve_col_widths[3])
+        self._curve_grid.addWidget(cmb_color, row, self._curve_grid_col(3))
+
+        spin_width = _NoWheelSpinBox()
+        spin_width.setRange(0.25, 10.0)
+        spin_width.setSingleStep(0.25)
+        spin_width.setDecimals(2)
+        spin_width.setValue(float(curve.get("width", 1.5)))
+        spin_width.setFixedWidth(self._curve_col_widths[4])
+        spin_width.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._curve_grid.addWidget(spin_width, row, self._curve_grid_col(4))
+        self._curve_row_widgets.append([chk_show, cmb_type, le_legend, cmb_color, spin_width])
+        for col_index, widget in enumerate(self._curve_row_widgets[-1]):
+            widget.installEventFilter(self)
+            widget.setProperty("curve_row", row_index)
+            widget.setProperty("curve_col", col_index)
+
+        def _sync_curve():
+            curve["visible"] = chk_show.isChecked()
+            curve["type"] = cmb_type.currentData()
+            legend_text = self._normalise_legend_text(le_legend.text().strip() or f"curve {row}")
+            curve["legend"] = legend_text
+            if le_legend.text() != legend_text:
+                le_legend.blockSignals(True)
+                le_legend.setText(legend_text)
+                le_legend.blockSignals(False)
+            color_data = cmb_color.currentData()
+            if color_data != "__more__":
+                curve["color"] = str(color_data)
+            curve["width"] = float(spin_width.value())
+            self._redraw_all()
+
+        def _choose_color(index: int):
+            item_data = cmb_color.itemData(index)
+            if item_data != "__more__":
+                _sync_curve()
+                return
+            initial = QColor(str(curve.get("color", "#1f77b4")))
+            chosen = QColorDialog.getColor(initial, self, "Select curve color")
+            if chosen.isValid():
+                label = chosen.name().upper()
+                insert_at = max(0, cmb_color.count() - 1)
+                cmb_color.insertItem(insert_at, label, chosen.name())
+                cmb_color.setCurrentIndex(insert_at)
+                curve["color"] = chosen.name()
+            else:
+                current = str(curve.get("color", "#1f77b4"))
+                def _restore_current_color():
+                    restored = False
+                    for i in range(cmb_color.count()):
+                        data = cmb_color.itemData(i)
+                        if data != "__more__" and str(data).lower() == QColor(current).name().lower():
+                            cmb_color.blockSignals(True)
+                            cmb_color.setCurrentIndex(i)
+                            cmb_color.blockSignals(False)
+                            restored = True
+                            break
+                    if not restored:
+                        insert_at = max(0, cmb_color.count() - 1)
+                        cmb_color.insertItem(insert_at, QColor(current).name().upper(), QColor(current).name())
+                        cmb_color.blockSignals(True)
+                        cmb_color.setCurrentIndex(insert_at)
+                        cmb_color.blockSignals(False)
+                    self._refresh_curve_color_combo(cmb_color)
+                    _sync_curve()
+                QTimer.singleShot(0, _restore_current_color)
+                return
+            self._refresh_curve_color_combo(cmb_color)
+            _sync_curve()
+
+        chk_show.toggled.connect(lambda _checked: _sync_curve())
+        cmb_type.currentIndexChanged.connect(lambda _idx: _sync_curve())
+        le_legend.editingFinished.connect(_sync_curve)
+        cmb_color.currentIndexChanged.connect(lambda idx: (self._refresh_curve_color_combo(cmb_color), _choose_color(idx)))
+        spin_width.valueChanged.connect(lambda _value: _sync_curve())
+        self.btn_clear_curves.setEnabled(True)
+        self._update_curve_selection_buttons()
+        _sync_curve()
+
+    def _on_clear_view_curves(self):
+        if not self._view_curves:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Clear curves",
+            "Clear all curves from the Curve View panel?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._view_curves.clear()
+        self._selected_curve_indices.clear()
+        self._curve_selection_anchor = None
+        while self._curve_grid.count() > 0:
+            item = self._curve_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._curve_row_widgets.clear()
+        self._curve_grid.setRowStretch(999, 1)
+        self._build_curve_grid_header()
+        self.btn_clear_curves.setEnabled(False)
+        self._update_curve_selection_buttons()
+        self._redraw_all()
+
+    def _rebuild_curve_rows(self):
+        curves = list(self._view_curves)
+        while self._curve_grid.count() > 0:
+            item = self._curve_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._view_curves = []
+        self._curve_row_widgets.clear()
+        self._build_curve_grid_header()
+        for curve in curves:
+            self._add_view_curve_row(curve)
+        self._selected_curve_indices = {
+            i for i in self._selected_curve_indices if i < len(self._view_curves)
+        }
+        self._curve_selection_anchor = None
+        self._apply_curve_row_selection_style()
+        self.btn_clear_curves.setEnabled(bool(self._view_curves))
+        self._update_curve_selection_buttons()
+        self._redraw_all()
+
+    def _on_clear_selected_view_curve(self):
+        remove_indices = {
+            i for i in self._selected_curve_indices if 0 <= i < len(self._view_curves)
+        }
+        if not remove_indices:
+            return
+        self._view_curves = [
+            curve
+            for i, curve in enumerate(self._view_curves)
+            if i not in remove_indices
+        ]
+        self._selected_curve_indices.clear()
+        self._curve_selection_anchor = None
+        self._rebuild_curve_rows()
+
+    def _selected_curve_index_list(self) -> list[int]:
+        return sorted(
+            i for i in self._selected_curve_indices if 0 <= i < len(self._view_curves)
+        )
+
+    def _set_curve_order_and_selection(self, curves: list[dict], selected_old_indices: set[int]):
+        selected_ids = {id(self._view_curves[i]) for i in selected_old_indices}
+        self._view_curves = curves
+        self._selected_curve_indices = {
+            i for i, curve in enumerate(self._view_curves) if id(curve) in selected_ids
+        }
+        self._curve_selection_anchor = min(self._selected_curve_indices) if self._selected_curve_indices else None
+        self._rebuild_curve_rows()
+
+    def _on_move_selected_curves_to_top(self):
+        selected = set(self._selected_curve_index_list())
+        if not selected:
+            return
+        moved = [curve for i, curve in enumerate(self._view_curves) if i in selected]
+        rest = [curve for i, curve in enumerate(self._view_curves) if i not in selected]
+        self._set_curve_order_and_selection(moved + rest, selected)
+
+    def _on_move_selected_curves_up(self):
+        selected = set(self._selected_curve_index_list())
+        if not selected:
+            return
+        curves = list(self._view_curves)
+        for i in range(1, len(curves)):
+            if i in selected and (i - 1) not in selected:
+                curves[i - 1], curves[i] = curves[i], curves[i - 1]
+        self._set_curve_order_and_selection(curves, selected)
+
+    def _on_move_selected_curves_down(self):
+        selected = set(self._selected_curve_index_list())
+        if not selected:
+            return
+        curves = list(self._view_curves)
+        for i in range(len(curves) - 2, -1, -1):
+            if i in selected and (i + 1) not in selected:
+                curves[i + 1], curves[i] = curves[i], curves[i + 1]
+        self._set_curve_order_and_selection(curves, selected)
+
+    def _on_batch_import_curves(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Batch import curves",
+            "",
+            "MAT files (*.mat)",
+        )
+        if not paths:
+            return
+        if not self._curve_view_dock.isVisible():
+            self._curve_view_dock.setFloating(True)
+            self._curve_view_dock.show()
+        if not self.chk_multi_curve.isChecked():
+            self.chk_multi_curve.setChecked(True)
+        added = 0
+        skipped: list[str] = []
+        for path in paths:
+            try:
+                mat = loadmat(path, squeeze_me=True, struct_as_record=False)
+                base_legend = self._curve_legend_from_mat(mat, Path(path).stem)
+                t_sim = self._mat_array(mat, "t_sim")
+                R_sim = self._mat_array(mat, "R_sim")
+                t_exp = self._mat_array(mat, "t_exp")
+                R_exp = self._mat_array(mat, "R_exp")
+                has_exp_curve = t_exp.size >= 3 and R_exp.size >= 3
+                has_sim_curve = t_sim.size >= 3 and R_sim.size >= 3
+                if t_exp.size >= 3 and R_exp.size >= 3:
+                    self._add_curve_to_view(
+                        curve_type="auto",
+                        t=t_exp,
+                        R=R_exp,
+                        legend=f"{base_legend} exp" if has_sim_curve else base_legend,
+                        redraw=False,
+                    )
+                    added += 1
+                if t_sim.size >= 3 and R_sim.size >= 3:
+                    meta = {
+                        "Rmax": self._mat_to_float(mat, "Rmax_sim", float(np.nanmax(R_sim))),
+                        "t_rmax": 0.0,
+                        "tc": self._mat_to_float(mat, "tc", 1.0),
+                    }
+                    self._add_curve_to_view(
+                        curve_type="simulation",
+                        t=t_sim,
+                        R=R_sim,
+                        legend=f"{base_legend} sim" if has_exp_curve else base_legend,
+                        meta=meta,
+                        redraw=False,
+                    )
+                    added += 1
+                if t_exp.size >= 3 or t_sim.size >= 3:
+                    continue
+                exp = load_experiment_mat(path)
+                self._add_curve_to_view(
+                    curve_type="auto",
+                    t=exp.t,
+                    R=exp.R,
+                    legend=base_legend,
+                    redraw=False,
+                )
+                added += 1
+            except Exception as exc:
+                skipped.append(f"{Path(path).name}: {exc}")
+        self._redraw_all()
+        self.statusBar().showMessage(f"Imported {added} curve(s).")
+        self.lbl_output.appendPlainText(f"Imported {added} curve(s) into Curve View.")
+        if skipped:
+            detail = "\n".join(skipped[:20])
+            if len(skipped) > 20:
+                detail += f"\n... and {len(skipped) - 20} more"
+            QMessageBox.warning(
+                self,
+                "Some curves were skipped",
+                f"Imported {added} curve(s), skipped {len(skipped)} file(s).\n\n{detail}",
+            )
+
+    def _view_export_curves(self) -> list[dict]:
+        return [
+            curve
+            for curve in self._view_curves
+            if curve.get("visible", True)
+        ] or list(self._view_curves)
+
+    def _view_export_stem(self) -> str:
+        if self.state.exp_path:
+            return f"{Path(self.state.exp_path).stem}_view"
+        return f"imr_view_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def _on_export_view_mat(self):
+        curves = self._view_export_curves()
+        if not curves:
+            QMessageBox.information(self, "No curves", "There are no curves to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Curve View as .mat",
+            f"{self._view_export_stem()}.mat",
+            "MAT files (*.mat)",
+        )
+        if not path:
+            return
+
+        n = len(curves)
+        t_cells = np.empty((1, n), dtype=object)
+        r_cells = np.empty((1, n), dtype=object)
+        legends = np.empty((1, n), dtype=object)
+        types = np.empty((1, n), dtype=object)
+        colors = np.empty((1, n), dtype=object)
+        widths = np.zeros((1, n), dtype=float)
+        visible = np.zeros((1, n), dtype=bool)
+        for i, curve in enumerate(curves):
+            t_cells[0, i] = np.asarray(curve.get("t", []), dtype=float).reshape(-1)
+            r_cells[0, i] = np.asarray(curve.get("R", []), dtype=float).reshape(-1)
+            legends[0, i] = str(curve.get("legend", f"curve {i + 1}"))
+            types[0, i] = str(curve.get("type", "simulation"))
+            colors[0, i] = str(curve.get("color", "#1f77b4"))
+            widths[0, i] = float(curve.get("width", 1.5))
+            visible[0, i] = bool(curve.get("visible", True))
+
+        savemat(
+            path,
+            {
+                "imr_view_format": "IMR fitting GUI curve view",
+                "view_mode": self.state.view_mode,
+                "time_unit": "s",
+                "radius_unit": "m",
+                "curve_t": t_cells,
+                "curve_R": r_cells,
+                "curve_legend": legends,
+                "curve_type": types,
+                "curve_color": colors,
+                "curve_width": widths,
+                "curve_visible": visible,
+                "n_curves": n,
+            },
+            do_compression=False,
+        )
+        self.statusBar().showMessage(f"Exported Curve View MAT: {path}")
+
+    def _with_transparent_canvas(self, callback):
+        fig = self.canvas.figure
+        ax = self.canvas.ax
+        old_fig_alpha = fig.patch.get_alpha()
+        old_ax_alpha = ax.patch.get_alpha()
+        old_fig_face = fig.patch.get_facecolor()
+        old_ax_face = ax.patch.get_facecolor()
+        try:
+            fig.patch.set_alpha(0.0)
+            ax.patch.set_alpha(0.0)
+            return callback()
+        finally:
+            fig.patch.set_facecolor(old_fig_face)
+            ax.patch.set_facecolor(old_ax_face)
+            fig.patch.set_alpha(old_fig_alpha)
+            ax.patch.set_alpha(old_ax_alpha)
+            self.canvas.draw_idle()
+
+    def _on_export_view_svg(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Curve View as .svg",
+            f"{self._view_export_stem()}.svg",
+            "SVG files (*.svg)",
+        )
+        if not path:
+            return
+        self._redraw_all()
+
+        def _save():
+            self.canvas.figure.savefig(
+                path,
+                format="svg",
+                transparent=True,
+                facecolor="none",
+                edgecolor="none",
+                bbox_inches="tight",
+            )
+
+        self._with_transparent_canvas(_save)
+        self.statusBar().showMessage(f"Exported Curve View SVG: {path}")
+
+    def _on_copy_view_png(self):
+        self._redraw_all()
+
+        def _copy():
+            buf = BytesIO()
+            self.canvas.figure.savefig(
+                buf,
+                format="png",
+                dpi=300,
+                transparent=True,
+                facecolor="none",
+                edgecolor="none",
+                bbox_inches="tight",
+            )
+            png_data = buf.getvalue()
+            image = QImage.fromData(png_data)
+            if image.isNull():
+                raise RuntimeError("Failed to render Curve View image.")
+            mime = QMimeData()
+            mime.setData("image/png", QByteArray(png_data))
+            mime.setImageData(image)
+            QApplication.clipboard().setMimeData(mime)
+
+        try:
+            self._with_transparent_canvas(_copy)
+        except Exception as exc:
+            QMessageBox.warning(self, "Copy view failed", str(exc))
+            return
+        self.statusBar().showMessage("Copied Curve View PNG to clipboard.")
+
+    def _on_copy_view_svg(self):
+        self._redraw_all()
+
+        def _copy():
+            buf = BytesIO()
+            self.canvas.figure.savefig(
+                buf,
+                format="svg",
+                transparent=True,
+                facecolor="none",
+                edgecolor="none",
+                bbox_inches="tight",
+            )
+            svg_data = buf.getvalue()
+            if not svg_data:
+                raise RuntimeError("Failed to render Curve View SVG.")
+            mime = QMimeData()
+            mime.setData("image/svg+xml", QByteArray(svg_data))
+            try:
+                mime.setText(svg_data.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+            QApplication.clipboard().setMimeData(mime)
+
+        try:
+            self._with_transparent_canvas(_copy)
+        except Exception as exc:
+            QMessageBox.warning(self, "Copy view failed", str(exc))
+            return
+        self.statusBar().showMessage("Copied Curve View SVG to clipboard.")
 
     # =====================================================================
     # =====================================================================
@@ -1956,6 +3146,11 @@ class MainWindow(QMainWindow):
             fw["row_widget"].setEnabled(is_fitting)
             fw["cmb_scale"].setEnabled(is_fitting)
 
+        if is_fitting and self.spin_fit_window_cycles.value() < 1:
+            self.spin_fit_window_cycles.blockSignals(True)
+            self.spin_fit_window_cycles.setValue(1)
+            self.spin_fit_window_cycles.blockSignals(False)
+
         self._fit_window_widget.setVisible(not is_jobs)
         if hasattr(self, "_left_stack"):
             self._left_stack.setCurrentIndex(1 if is_jobs else 0)
@@ -2427,6 +3622,10 @@ class MainWindow(QMainWindow):
         if self.state.exp_t is None or self.state.exp_R is None:
             return
         cycles = int(self.spin_fit_window_cycles.value())
+        if cycles <= 0:
+            if self.state.mode in ("simulation", "fitting"):
+                self._redraw_all()
+            return
         i0, i1, found = self._fit_window_cycle_indices(cycles)
         t = self.state.exp_t
         if t is None or t.size == 0:
@@ -2466,6 +3665,8 @@ class MainWindow(QMainWindow):
     ) -> tuple[float, float, int]:
         if self.chk_fit_window_cycles.isChecked():
             cycles = int(self.spin_fit_window_cycles.value())
+            if cycles <= 0:
+                return float(t[0]), float(t[-1]), cycles
             i0, i1, _found = self._fit_window_cycle_indices_for(t, R, cycles, model_key)
             t_start_s = float(t[i0])
             t_end_s = float(t[i1])
@@ -2510,6 +3711,7 @@ class MainWindow(QMainWindow):
 
     def _redraw_all(self):
         self.canvas.ax.clear()
+        self.canvas.handles = PlotHandles()
         if self.state.view_mode == "dimensional":
             self.canvas.ax.set_xlabel("t (µs)")
             self.canvas.ax.set_ylabel("R (µm)")
@@ -2546,7 +3748,68 @@ class MainWindow(QMainWindow):
             t_exp = np.array([], dtype=float)
             R_exp = np.array([], dtype=float)
 
-        if t_exp.size > 0 and R_exp.size > 0:
+        if self._curve_view_active():
+            plotted_curve_count = 0
+            for curve in self._view_curves:
+                if not curve.get("visible", True):
+                    continue
+                t_curve = np.asarray(curve.get("t", []), dtype=float).reshape(-1)
+                R_curve = np.asarray(curve.get("R", []), dtype=float).reshape(-1)
+                n_curve = min(t_curve.size, R_curve.size)
+                if n_curve <= 0:
+                    continue
+                t_curve = t_curve[:n_curve]
+                R_curve = R_curve[:n_curve]
+                meta = dict(curve.get("meta", {}) or {})
+                if self.state.view_mode == "dimensional":
+                    t_plot = t_curve * 1e6
+                    R_plot = R_curve * 1e6
+                else:
+                    if curve.get("type") == "simulation" and meta:
+                        tc = float(meta.get("tc", 1.0)) or 1.0
+                        rmax = float(meta.get("Rmax", 1.0)) or 1.0
+                        t_rmax = float(meta.get("t_rmax", 0.0))
+                        t_plot = (t_curve - t_rmax) / tc
+                        R_plot = R_curve / rmax
+                    else:
+                        rmax = float(np.nanmax(R_curve)) if R_curve.size else 1.0
+                        if not np.isfinite(rmax) or rmax == 0:
+                            rmax = 1.0
+                        idx_rmax = int(np.nanargmax(R_curve)) if R_curve.size else 0
+                        t_rmax = float(t_curve[idx_rmax]) if t_curve.size else 0.0
+                        P_inf = float(self.spin_P_inf.value())
+                        rho = float(self.spin_rho.value())
+                        R_eq = float(self.spin_Req_um.value()) * 1e-6
+                        Uc = np.sqrt(P_inf / rho) if rho > 0 else 1.0
+                        tc = R_eq / Uc if Uc > 0 else 1.0
+                        t_plot = (t_curve - t_rmax) / tc
+                        R_plot = R_curve / rmax
+                label = str(curve.get("legend", "curve"))
+                color = str(curve.get("color", "#1f77b4"))
+                width = float(curve.get("width", 1.5))
+                if curve.get("type") == "experiment":
+                    self.canvas.ax.plot(
+                        t_plot,
+                        R_plot,
+                        linestyle="None",
+                        marker="s",
+                        markersize=max(1.5, width + 0.5),
+                        color=color,
+                        label=label,
+                    )
+                else:
+                    self.canvas.ax.plot(
+                        t_plot,
+                        R_plot,
+                        "-",
+                        linewidth=width,
+                        color=color,
+                        label=label,
+                    )
+                plotted_curve_count += 1
+            if 0 < plotted_curve_count <= 16:
+                self.canvas.ax.legend(loc="best")
+        elif t_exp.size > 0 and R_exp.size > 0:
             if self.state.view_mode == "dimensional":
                 t_plot = t_exp * 1e6
                 R_plot = R_exp * 1e6
@@ -2566,6 +3829,8 @@ class MainWindow(QMainWindow):
                 self.canvas.set_drag_limits(float(t_plot[0]), float(t_plot[-1]))
 
         if (
+            not self._curve_view_active()
+            and
             self.state.sim_t is not None
             and self.state.sim_R is not None
             and self.state.sim_meta is not None
@@ -2606,7 +3871,16 @@ class MainWindow(QMainWindow):
                     R_plot = best_fit_R
             self.canvas.plot_fit_best(t_plot, R_plot)
 
-        if self.state.mode in ("simulation", "fitting") and self.state.exp_t is not None:
+        hide_fit_window = (
+            self.state.mode == "simulation"
+            and self.chk_fit_window_cycles.isChecked()
+            and int(self.spin_fit_window_cycles.value()) <= 0
+        )
+        if (
+            not hide_fit_window
+            and self.state.mode in ("simulation", "fitting")
+            and self.state.exp_t is not None
+        ):
             t0_view = self._time_s_to_view(
                 float(self.spin_t_fit_start.value()) * 1e-6
             )
@@ -2628,6 +3902,8 @@ class MainWindow(QMainWindow):
             self.canvas.handles.exp_line is not None
             or self.canvas.handles.sim_line is not None
             or self.canvas.handles.fit_best_line is not None
+            or bool(self.canvas.ax.lines)
+            or bool(self.canvas.ax.collections)
         )
         if has_data:
             xlim = self.canvas.ax.get_xlim()
@@ -2714,6 +3990,22 @@ class MainWindow(QMainWindow):
                 self.spin_t_fit_end.setValue(float(self.state.exp_t[-1]) * 1e6)
                 if self.chk_fit_window_cycles.isChecked():
                     self._apply_fit_window_cycles()
+
+            if self._curve_view_active():
+                curve_legend = Path(path).stem
+                try:
+                    curve_legend = self._curve_legend_from_mat(
+                        loadmat(path, squeeze_me=True, struct_as_record=False),
+                        curve_legend,
+                    )
+                except Exception:
+                    curve_legend = self._normalise_legend_text(curve_legend)
+                self._add_curve_to_view(
+                    curve_type="experiment",
+                    t=exp.t,
+                    R=exp.R,
+                    legend=curve_legend,
+                )
 
             extra = ""
             if file_info:
@@ -3329,6 +4621,30 @@ class MainWindow(QMainWindow):
             raise ValueError("No finite numeric values were found.")
         return values
 
+    @staticmethod
+    def _sweep_legend_name(param_name: str) -> str:
+        greek = {
+            "alpha": r"\alpha",
+            "alphaA": r"\alphaA",
+            "alphaB": r"\alphaB",
+            "alphaC": r"\alphaC",
+            "beta": r"\beta",
+            "gamma": r"\gamma",
+            "lambda": r"\lambda",
+            "lambda_Y": r"\lambda_Y",
+            "mu": r"\mu",
+            "muB": r"\muB",
+            "muC": r"\muC",
+        }
+        return greek.get(param_name, param_name)
+
+    def _sweep_legend_text(self, param_name: str, display_value: float, unit_label: str = "") -> str:
+        name = self._sweep_legend_name(param_name)
+        unit = str(unit_label or "").strip()
+        if unit:
+            return f"{name} = {display_value:.6g} {unit}"
+        return f"{name} = {display_value:.6g}"
+
     def on_batch_create_simulation_jobs(self):
         if self.state.mode != "simulation":
             QMessageBox.information(
@@ -3450,6 +4766,8 @@ class MainWindow(QMainWindow):
         added: list[dict] = []
         skipped: list[str] = []
 
+        unit_labels = {name: unit_label for name, _label, unit_label, _base, _is_req in sweep_rows}
+
         for sweep_name, values in sweeps.items():
             factor = self._get_unit_factor(sweep_name)
             for display_value in values:
@@ -3492,6 +4810,11 @@ class MainWindow(QMainWindow):
                 stem = Path(exp_name).stem or "simulation"
                 suffix = self._safe_filename_part(f"{sweep_name}_{display_value:.6g}")
                 job["experiment"]["file_name"] = f"{stem}__{suffix}.mat"
+                job["legend"] = self._sweep_legend_text(
+                    sweep_name,
+                    float(display_value),
+                    unit_labels.get(sweep_name, ""),
+                )
                 job["sweep"] = {
                     "parameter": sweep_name,
                     "value_display": float(display_value),
@@ -3707,23 +5030,34 @@ class MainWindow(QMainWindow):
     def _job_result_output_path(self, job: dict, suffix: str = "result") -> Path:
         if self._queue_output_dir is None:
             raise ValueError("Queue output directory is not set.")
+        try:
+            row = self._jobs.index(job) + 1
+        except ValueError:
+            row = 1
+        candidate = self._job_result_file_name(job, row, suffix=suffix)
+        used = getattr(self, "_queue_export_names", set())
+        if candidate in used or (self._queue_output_dir / candidate).exists():
+            stem = Path(candidate).stem
+            ext = Path(candidate).suffix or ".mat"
+            counter = 2
+            while candidate in used or (self._queue_output_dir / candidate).exists():
+                candidate = f"{stem}_{counter:03d}{ext}"
+                counter += 1
+        used.add(candidate)
+        self._queue_export_names = used
+        return self._queue_output_dir / candidate
+
+    def _job_result_file_name(self, job: dict, row: int, suffix: str = "result") -> str:
         exp = job.get("experiment", {}) or {}
         raw_name = str(exp.get("file_name", "") or "job")
         stem = Path(raw_name).stem
         stem = self._clean_imported_experiment_name(stem)
         stem = Path(stem).stem
         stem = re.sub(r"(?i)(?:_?simulation)?_?result$", "", stem).strip("._ ")
-        base = self._safe_filename_part(stem)
+        exp_stem = self._safe_filename_part(stem)
+        model = self._safe_filename_part(self._job_model_label(str(job.get("model", ""))))
         suffix = self._safe_filename_part(suffix)
-        candidate = f"{base}_{suffix}.mat"
-        used = getattr(self, "_queue_export_names", set())
-        counter = 2
-        while candidate in used or (self._queue_output_dir / candidate).exists():
-            candidate = f"{base}_{counter:03d}_{suffix}.mat"
-            counter += 1
-        used.add(candidate)
-        self._queue_export_names = used
-        return self._queue_output_dir / candidate
+        return f"job_{row:03d}_{exp_stem}_{model}_{suffix}.mat"
 
     @staticmethod
     def _preview_curve(t, R, max_points: int = 2000) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -3854,10 +5188,21 @@ class MainWindow(QMainWindow):
         val = mat[key]
         if isinstance(val, str):
             return val
+        if isinstance(val, bytes):
+            return val.decode(errors="replace")
         arr = np.asarray(val)
         if arr.size == 0:
             return default
         try:
+            if arr.dtype.kind in ("U", "S"):
+                flat = arr.reshape(-1)
+                parts = [
+                    x.decode(errors="replace") if isinstance(x, bytes) else str(x)
+                    for x in flat
+                ]
+                if flat.size > 1 and all(len(part) <= 1 for part in parts):
+                    return "".join(parts)
+                return parts[0]
             first = arr.reshape(-1)[0]
             if isinstance(first, bytes):
                 return first.decode(errors="replace")
@@ -4237,6 +5582,9 @@ class MainWindow(QMainWindow):
             "NT": int(phys.get("NT", 0)),
             "LSQErr": np.nan if lsq_err is None else float(lsq_err),
         }
+        legend = str(job.get("legend", "")).strip()
+        if legend:
+            export["legend"] = legend
         fit_window = dict(job.get("fit_window", {}) or {})
         export["fit_window_mode"] = str(fit_window.get("mode", ""))
         export["fit_window_cycles"] = (
@@ -4417,9 +5765,7 @@ class MainWindow(QMainWindow):
         if preview is not None:
             meta["preview_file"] = f"previews/job_{row:03d}_preview.mat"
         if self._job_result_mat_bytes(job) is not None:
-            exp_stem = self._safe_filename_part(Path(str(exp.get("file_name", ""))).stem)
-            model = self._safe_filename_part(self._job_model_label(str(job.get("model", ""))))
-            meta["result_file"] = f"results/job_{row:03d}_{exp_stem}_{model}_result.mat"
+            meta["result_file"] = f"results/{self._job_result_file_name(job, row, suffix='result')}"
         return self._json_safe(meta)
 
     def on_export_job_queue(self):
@@ -5206,6 +6552,15 @@ class MainWindow(QMainWindow):
             self.state.sim_R = out.R_sim
             self.state.sim_meta = {"Rmax": out.Rmax_sim, "t_rmax": 0.0, "tc": out.tc}
             self.state.sim_out = out
+
+            if self._curve_view_active():
+                self._add_curve_to_view(
+                    curve_type="simulation",
+                    t=out.t_sim,
+                    R=out.R_sim,
+                    legend=f"{model_key} simulation {len(self._view_curves) + 1}",
+                    meta=self.state.sim_meta,
+                )
 
             self._redraw_all()
 
