@@ -26,6 +26,7 @@ imr_gui/settings.json
 
 # test data
 test/
+build_exe.txt
 
 
 # Demo
