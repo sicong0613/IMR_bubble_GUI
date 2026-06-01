@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.io import loadmat, savemat
+from scipy.signal import medfilt
 try:
     import mat73 as _mat73
     _HAS_MAT73 = True
@@ -72,6 +73,8 @@ from imr_gui.imr import NhkvRmaxInputs, simulate_nhkv_rmax_lic
 from imr_gui.imr import GMODInputs, simulate_gmod_lic
 from imr_gui.imr import GMOD1Inputs, simulate_gmod1_lic
 from imr_gui.io import load_experiment_mat, find_rmax_value
+from imr_gui.io.mat_loader import ExperimentData
+from imr_gui.io.mat_loader import _find_rmax_time
 from imr_gui.ui.mpl_canvas import MplCanvas, PlotHandles
 from imr_gui.constitutive import (
     load_nhkv_model,
@@ -102,6 +105,46 @@ class _NoWheelComboBox(QComboBox):
     value changes while scrolling the parent panel)."""
 
     def wheelEvent(self, event):  # noqa: N802
+        event.ignore()
+
+
+class _MatDropFrame(QFrame):
+    """Small drag/drop target for MAT files."""
+
+    fileDropped = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setObjectName("matDropFrame")
+        self.setStyleSheet(
+            "#matDropFrame {"
+            "border: 2px dashed #7a7a7a;"
+            "border-radius: 4px;"
+            "background: rgba(255, 255, 255, 0.03);"
+            "}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        label = QLabel("Drop .mat file here")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(label)
+
+    def dragEnterEvent(self, event):  # noqa: N802
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and url.toLocalFile().lower().endswith(".mat"):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):  # noqa: N802
+        for url in event.mimeData().urls():
+            if url.isLocalFile() and url.toLocalFile().lower().endswith(".mat"):
+                self.fileDropped.emit(url.toLocalFile())
+                event.acceptProposedAction()
+                return
         event.ignore()
 
 
@@ -277,6 +320,7 @@ class AppState:
     exp_t: np.ndarray | None = None
     exp_R: np.ndarray | None = None
     exp_path: str | None = None
+    import_metadata: dict | None = None
     view_mode: str = "dimensional"  # or "normalized"
     sim_t: np.ndarray | None = None
     sim_R: np.ndarray | None = None
@@ -506,6 +550,30 @@ class MainWindow(QMainWindow):
             "beta1": "beta",
         },
     }
+    DEFAULT_IMPORT_WIZARD_KEYWORDS = {
+        "t_exp": ["t_exp", "t", "time", "time_exp"],
+        "R_exp": ["R_exp", "R", "radius", "radius_exp", "R1_exp"],
+        "t_sim": ["t_sim", "simulation_t", "sim_t", "t_fit", "best_fit_t"],
+        "R_sim": ["R_sim", "simulation_R", "sim_R", "R_fit", "best_fit_R"],
+        "legend": ["legend", "label", "curve_label"],
+        "Req": ["Req", "R_eq", "R_equilibrium", "R1_eq"],
+        "Rmax": ["Rmax", "R_max"],
+        "P_inf": ["P_inf", "Pinf", "pinf"],
+        "rho": ["rho", "density"],
+        "c_long": ["c_long", "c", "sound_speed"],
+        "gamma": ["gamma", "surface_tension"],
+        "t_start": ["t_start", "fit_window_start"],
+        "t_end": ["t_end", "fit_window_end"],
+        "LSQErr": ["LSQErr", "lsqerr", "loss"],
+    }
+    DEFAULT_IMPORT_WIZARD_UNITS = {
+        "t_exp": "s",
+        "R_exp": "m",
+        "t_sim": "s",
+        "R_sim": "m",
+        "Req": "m",
+        "Rmax": "m",
+    }
 
     def __init__(self):
         super().__init__()
@@ -562,6 +630,13 @@ class MainWindow(QMainWindow):
         self._curve_color_mode: str = "distinct"
         self._selected_curve_indices: set[int] = set()
         self._curve_selection_anchor: int | None = None
+        self._import_wizard_keywords: dict[str, list[str]] = self._normalise_import_wizard_keywords({})
+        self._import_wizard_units: dict[str, str] = dict(self.DEFAULT_IMPORT_WIZARD_UNITS)
+        self._import_wizard_um_per_pixel: float = 3.2
+        self._import_wizard_fps: float = 1_000_000.0
+        self._import_wizard_remove_below: bool = False
+        self._import_wizard_remove_spikes: bool = False
+        self._import_wizard_spike_threshold: float = 2.0
 
         self._build_menu()
         self._build_ui()
@@ -579,6 +654,8 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("File")
         self._act_load_exp = file_menu.addAction("Load experiment data (.mat)")
         self._act_load_exp.triggered.connect(self.on_load_experiment)
+        self._act_import_wizard = file_menu.addAction("Import Wizard...")
+        self._act_import_wizard.triggered.connect(self.on_import_wizard)
         file_menu.addSeparator()
         self._act_load_params = file_menu.addAction("Load parameters (MAT)...")
         self._act_load_params.triggered.connect(self.on_load_params)
@@ -2729,6 +2806,40 @@ class MainWindow(QMainWindow):
         }
         return out
 
+    @classmethod
+    def _normalise_import_wizard_keywords(cls, data: dict) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        source = data if isinstance(data, dict) else {}
+        for field, defaults in cls.DEFAULT_IMPORT_WIZARD_KEYWORDS.items():
+            values = source.get(field, defaults)
+            if not isinstance(values, (list, tuple)):
+                values = defaults
+            cleaned: list[str] = []
+            for value in values:
+                text = str(value).strip()
+                if text and text not in cleaned:
+                    cleaned.append(text)
+            out[field] = cleaned or list(defaults)
+        return out
+
+    @classmethod
+    def _normalise_import_wizard_units(cls, data: dict) -> dict[str, str]:
+        out = dict(cls.DEFAULT_IMPORT_WIZARD_UNITS)
+        source = data if isinstance(data, dict) else {}
+        valid = {
+            "t_exp": {"s", "us"},
+            "R_exp": {"m", "um", "pixel"},
+            "t_sim": {"s", "us"},
+            "R_sim": {"m", "um"},
+            "Req": {"m", "um"},
+            "Rmax": {"m", "um"},
+        }
+        for name, allowed in valid.items():
+            unit = str(source.get(name, out.get(name, "")))
+            if unit in allowed:
+                out[name] = unit
+        return out
+
     def _parameter_defaults_for_model(self, model_key: str) -> dict:
         ui = self._normalise_ui_defaults(self._saved_ui_defaults)
         model_data = ui.get("models", {}).get(model_key, {})
@@ -2827,6 +2938,15 @@ class MainWindow(QMainWindow):
                 "parallel_workers": self._job_parallel_workers,
                 "import_name_cleanup_enabled": self._job_import_name_cleanup_enabled,
                 "import_name_cleanup_regex": self._job_import_name_cleanup_regex,
+            },
+            "import_wizard": {
+                "keywords": self._normalise_import_wizard_keywords(self._import_wizard_keywords),
+                "units": self._normalise_import_wizard_units(self._import_wizard_units),
+                "um_per_pixel": float(self._import_wizard_um_per_pixel),
+                "fps": float(self._import_wizard_fps),
+                "remove_negative_R": bool(self._import_wizard_remove_below),
+                "remove_isolated_spikes": bool(self._import_wizard_remove_spikes),
+                "spike_threshold": float(self._import_wizard_spike_threshold),
             },
         }
         if include_ui:
@@ -2933,6 +3053,27 @@ class MainWindow(QMainWindow):
             self._job_import_name_cleanup_enabled = bool(job_list["import_name_cleanup_enabled"])
         if "import_name_cleanup_regex" in job_list:
             self._job_import_name_cleanup_regex = str(job_list["import_name_cleanup_regex"])
+
+        import_wizard = data.get("import_wizard", {})
+        if isinstance(import_wizard, dict):
+            self._import_wizard_keywords = self._normalise_import_wizard_keywords(
+                import_wizard.get("keywords", {})
+            )
+            self._import_wizard_units = self._normalise_import_wizard_units(
+                import_wizard.get("units", {})
+            )
+            if "um_per_pixel" in import_wizard:
+                self._import_wizard_um_per_pixel = float(import_wizard["um_per_pixel"])
+            if "fps" in import_wizard:
+                self._import_wizard_fps = float(import_wizard["fps"])
+            if "remove_negative_R" in import_wizard:
+                self._import_wizard_remove_below = bool(import_wizard["remove_negative_R"])
+            elif "remove_below_threshold" in import_wizard:
+                self._import_wizard_remove_below = bool(import_wizard["remove_below_threshold"])
+            if "remove_isolated_spikes" in import_wizard:
+                self._import_wizard_remove_spikes = bool(import_wizard["remove_isolated_spikes"])
+            if "spike_threshold" in import_wizard:
+                self._import_wizard_spike_threshold = float(import_wizard["spike_threshold"])
 
         if ui.get("Req_um") is not None:
             self.spin_Req_um.setValue(float(ui["Req_um"]))
@@ -3917,6 +4058,1109 @@ class MainWindow(QMainWindow):
                 self.canvas.zoom_y(y_frac)
 
     # =====================================================================
+    # import wizard
+    # =====================================================================
+
+    @staticmethod
+    def _wizard_load_mat(path: str) -> dict:
+        try:
+            return loadmat(path, squeeze_me=True, struct_as_record=False)
+        except Exception:
+            if _HAS_MAT73:
+                return _mat73.loadmat(path)
+            raise
+
+    @staticmethod
+    def _wizard_flatten_namespace(mat: dict) -> dict:
+        flat: dict[str, object] = {}
+
+        def add(prefix: str, value, depth: int = 0):
+            if not prefix or prefix.startswith("__"):
+                return
+            flat[prefix] = value
+            if depth >= 2:
+                return
+            if isinstance(value, dict):
+                for key, sub in value.items():
+                    add(f"{prefix}.{key}", sub, depth + 1)
+                return
+            if hasattr(value, "_fieldnames"):
+                for field in value._fieldnames:
+                    add(f"{prefix}.{field}", getattr(value, field), depth + 1)
+                return
+            arr = np.asarray(value)
+            if arr.dtype.kind == "O" and arr.size == 1:
+                try:
+                    inner = arr.reshape(-1)[0]
+                    if hasattr(inner, "_fieldnames"):
+                        for field in inner._fieldnames:
+                            add(f"{prefix}.{field}", getattr(inner, field), depth + 1)
+                    elif isinstance(inner, dict):
+                        for key, sub in inner.items():
+                            add(f"{prefix}.{key}", sub, depth + 1)
+                except Exception:
+                    pass
+
+        for key, value in mat.items():
+            add(str(key), value)
+        return flat
+
+    @staticmethod
+    def _wizard_is_numeric_array(value) -> bool:
+        try:
+            arr = np.asarray(value)
+            if arr.dtype.kind == "O":
+                return False
+            arr = np.squeeze(arr)
+            return arr.ndim == 1 and arr.size > 0 and arr.dtype.kind in "biufc"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _wizard_is_scalar_like(value) -> bool:
+        try:
+            arr = np.asarray(value)
+            if arr.dtype.kind == "O":
+                return False
+            arr = np.squeeze(arr)
+            return arr.size == 1 and arr.dtype.kind in "biufc"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _wizard_to_1d_float(value) -> np.ndarray:
+        arr = np.asarray(value)
+        arr = np.squeeze(arr)
+        if arr.ndim != 1:
+            raise ValueError(f"Expected a 1-D numeric array, got shape {arr.shape}.")
+        return arr.astype(float)
+
+    @staticmethod
+    def _wizard_to_float(value, default=None):
+        try:
+            arr = np.asarray(value)
+            if arr.size == 0:
+                return default
+            return float(arr.astype(float).reshape(-1)[0])
+        except Exception:
+            return default
+
+    def _wizard_to_string(self, value, default: str = "") -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return value.decode(errors="replace")
+        try:
+            arr = np.asarray(value)
+            if arr.size == 0:
+                return default
+            if arr.dtype.kind in ("U", "S"):
+                parts = [
+                    x.decode(errors="replace") if isinstance(x, bytes) else str(x)
+                    for x in arr.reshape(-1)
+                ]
+                if len(parts) > 1 and all(len(part) <= 1 for part in parts):
+                    return "".join(parts)
+                return parts[0]
+            first = arr.reshape(-1)[0]
+            if isinstance(first, bytes):
+                return first.decode(errors="replace")
+            return str(first)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _wizard_guess_key(keys: list[str], candidates: list[str]) -> str | None:
+        lower = {key.lower(): key for key in keys}
+        for cand in candidates:
+            hit = lower.get(cand.lower())
+            if hit is not None:
+                return hit
+        for cand in candidates:
+            cand_l = cand.lower()
+            for key in keys:
+                name = key.lower().split(".")[-1]
+                if name == cand_l or name.startswith(cand_l):
+                    return key
+        return None
+
+    def _wizard_combo(
+        self,
+        keys: list[str],
+        candidates: list[str],
+        scalar_only: bool = False,
+        flat: dict | None = None,
+    ) -> QComboBox:
+        combo = _NoWheelComboBox()
+        combo.addItem("(none)", None)
+        for key in keys:
+            if scalar_only and flat is not None and not self._wizard_is_scalar_like(flat[key]):
+                continue
+            combo.addItem(key, key)
+        guess_keys = [combo.itemText(i) for i in range(1, combo.count())]
+        guess = self._wizard_guess_key(guess_keys, candidates)
+        if guess:
+            idx = combo.findText(guess)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        return combo
+
+    def _import_unit_to_si(self, name: str, value, unit: str):
+        if value is None:
+            return None
+        if unit == "us":
+            return np.asarray(value, dtype=float) * 1e-6
+        if unit == "um":
+            return np.asarray(value, dtype=float) * 1e-6
+        if unit == "pixel":
+            return np.asarray(value, dtype=float) * float(self._import_wizard_um_per_pixel) * 1e-6
+        return value
+
+    def _confirm_import_default_units(
+        self,
+        *,
+        parent,
+        used_fps: bool,
+        r_unit: str,
+        t_unit: str,
+        accepted_state: dict | None = None,
+    ) -> bool:
+        uses_conversion = used_fps or r_unit in ("um", "pixel") or t_unit == "us"
+        risky_pixel_with_time = (not used_fps) and r_unit == "pixel"
+        if not uses_conversion and not risky_pixel_with_time:
+            return True
+        if accepted_state is not None and accepted_state.get("accepted", False):
+            return True
+        parts = []
+        if used_fps:
+            parts.append(f"t_exp is reconstructed from fps={float(self._import_wizard_fps):.3g}.")
+        elif t_unit == "us":
+            parts.append("t_exp is converted from us to seconds.")
+        if r_unit == "um":
+            parts.append("R_exp is converted from um to meters.")
+        elif r_unit == "pixel":
+            parts.append(
+                f"R_exp is converted from pixels using {float(self._import_wizard_um_per_pixel):.3g} um/pixel."
+            )
+        if risky_pixel_with_time:
+            parts.append(
+                "A time-axis variable is present while R_exp is set to pixel; "
+                "choose m or um instead if R is already physical radius."
+            )
+        reply = QMessageBox.warning(
+            parent or self,
+            "Confirm import units",
+            "\n".join(parts) + "\n\nContinue importing with these settings?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        ok = reply == QMessageBox.StandardButton.Yes
+        if ok and accepted_state is not None:
+            accepted_state["accepted"] = True
+        return ok
+
+    def _load_experiment_with_import_defaults(
+        self,
+        path: str,
+        *,
+        confirm_units: bool = False,
+        parent=None,
+        accepted_state: dict | None = None,
+    ) -> ExperimentData:
+        mat = self._wizard_load_mat(path)
+        flat = {
+            key: value for key, value in self._wizard_flatten_namespace(mat).items()
+            if not str(key).startswith("__")
+        }
+        keys = sorted(flat.keys(), key=str.lower)
+        array_keys = [key for key in keys if self._wizard_is_numeric_array(flat[key])]
+        scalar_keys = [key for key in keys if self._wizard_is_scalar_like(flat[key])]
+        t_key = self._wizard_guess_key(array_keys, self._import_wizard_keywords["t_exp"])
+        R_key = self._wizard_guess_key(array_keys, self._import_wizard_keywords["R_exp"])
+        if not R_key:
+            raise ValueError("Could not find R_exp using Import Wizard recognition names.")
+
+        r_unit = self._import_wizard_units.get("R_exp", "m")
+        t_unit = self._import_wizard_units.get("t_exp", "s")
+        R = self._wizard_to_1d_float(flat[R_key])
+        R = np.asarray(self._import_unit_to_si("R_exp", R, r_unit), dtype=float)
+        used_fps = False
+        if t_key:
+            t = self._wizard_to_1d_float(flat[t_key])
+            t = np.asarray(self._import_unit_to_si("t_exp", t, t_unit), dtype=float)
+        else:
+            fps = float(self._import_wizard_fps)
+            if not np.isfinite(fps) or fps <= 0:
+                raise ValueError("fps must be positive to reconstruct t_exp.")
+            t = np.arange(R.shape[0], dtype=float) / fps
+            used_fps = True
+        if t.shape[0] != R.shape[0]:
+            raise ValueError(f"t_exp and R_exp length mismatch: {t.shape[0]} vs {R.shape[0]}.")
+        if confirm_units and not self._confirm_import_default_units(
+            parent=parent or self,
+            used_fps=used_fps,
+            r_unit=r_unit,
+            t_unit=t_unit,
+            accepted_state=accepted_state,
+        ):
+            raise RuntimeError("Import cancelled by user.")
+
+        finite = np.isfinite(t) & np.isfinite(R)
+        if int(np.count_nonzero(finite)) < 3:
+            raise ValueError("Experiment data must contain at least 3 finite t/R pairs.")
+        t = t[finite]
+        R = R[finite]
+        n_before_cleanup = int(R.size)
+        cleanup_mask = np.ones(R.shape[0], dtype=bool)
+        if self._import_wizard_remove_below:
+            cleanup_mask &= R >= 0.0
+        if self._import_wizard_remove_spikes and R.size >= 3:
+            kernel = min(5, R.size if R.size % 2 == 1 else R.size - 1)
+            if kernel >= 3:
+                R_med = medfilt(R.astype(float), kernel_size=kernel)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    ratio = np.where(R_med > 0, R / R_med, 1.0)
+                cleanup_mask &= ratio <= float(self._import_wizard_spike_threshold)
+        if not np.all(cleanup_mask):
+            t = t[cleanup_mask]
+            R = R[cleanup_mask]
+        if R.size < 3:
+            raise ValueError(
+                f"Experiment data has fewer than 3 points after cleanup ({R.size})."
+            )
+        n_after_cleanup = int(R.size)
+        order = np.argsort(t)
+        t = t[order]
+        R = R[order]
+        t = t - _find_rmax_time(t, R, n_pts=7)
+
+        def scalar(name: str):
+            key = self._wizard_guess_key(scalar_keys, self._import_wizard_keywords[name])
+            if not key:
+                return None
+            val = self._wizard_to_float(flat[key], None)
+            if val is None:
+                return None
+            unit = self._import_wizard_units.get(name, "")
+            converted = self._import_unit_to_si(name, val, unit)
+            try:
+                return float(np.asarray(converted).reshape(-1)[0])
+            except Exception:
+                return None
+
+        exp = ExperimentData(
+            t=t,
+            R=R,
+            source_path=path,
+            t_key=t_key or f"fps:{float(self._import_wizard_fps):.6g}",
+            R_key=R_key,
+            P_inf=scalar("P_inf"),
+            rho=scalar("rho"),
+            R_eq=scalar("Req"),
+        )
+        exp_meta = {
+            "method": "import_defaults",
+            "source_path": path,
+            "t_key": t_key or "",
+            "R_key": R_key,
+            "t_unit": t_unit,
+            "R_unit": r_unit,
+            "used_fps": bool(used_fps),
+            "fps": float(self._import_wizard_fps),
+            "um_per_pixel": float(self._import_wizard_um_per_pixel),
+            "remove_negative_R": bool(self._import_wizard_remove_below),
+            "remove_isolated_spikes": bool(self._import_wizard_remove_spikes),
+            "spike_threshold": float(self._import_wizard_spike_threshold),
+            "n_points_before_cleanup": n_before_cleanup,
+            "n_points_after_cleanup": n_after_cleanup,
+            "n_points_removed_cleanup": n_before_cleanup - n_after_cleanup,
+        }
+        object.__setattr__(exp, "import_metadata", exp_meta)
+        return exp
+
+    def _apply_import_wizard_experiment(
+        self,
+        *,
+        path: str,
+        t: np.ndarray,
+        R: np.ndarray,
+        legend: str,
+        Req: float | None,
+        P_inf: float | None,
+        rho: float | None,
+        c_long: float | None,
+        gamma: float | None,
+        t_sim: np.ndarray | None = None,
+        R_sim: np.ndarray | None = None,
+        import_metadata: dict | None = None,
+    ):
+        finite = np.isfinite(t) & np.isfinite(R)
+        if int(np.count_nonzero(finite)) < 3:
+            raise ValueError("Experiment data must contain at least 3 finite t/R pairs.")
+        t = np.asarray(t[finite], dtype=float).reshape(-1)
+        R = np.asarray(R[finite], dtype=float).reshape(-1)
+        order = np.argsort(t)
+        t = t[order]
+        R = R[order]
+        t = t - _find_rmax_time(t, R, n_pts=7)
+
+        sim_t_clean = None
+        sim_R_clean = None
+        sim_meta = None
+        if t_sim is not None or R_sim is not None:
+            if t_sim is None or R_sim is None:
+                raise ValueError("Please map both t_sim and R_sim, or leave both empty.")
+            t_sim_arr = np.asarray(t_sim, dtype=float).reshape(-1)
+            R_sim_arr = np.asarray(R_sim, dtype=float).reshape(-1)
+            if t_sim_arr.shape[0] != R_sim_arr.shape[0]:
+                raise ValueError(
+                    f"t_sim and R_sim length mismatch: {t_sim_arr.shape[0]} vs {R_sim_arr.shape[0]}."
+                )
+            finite_sim = np.isfinite(t_sim_arr) & np.isfinite(R_sim_arr)
+            if int(np.count_nonzero(finite_sim)) >= 2:
+                sim_t_clean = t_sim_arr[finite_sim]
+                sim_R_clean = R_sim_arr[finite_sim]
+                sim_order = np.argsort(sim_t_clean)
+                sim_t_clean = sim_t_clean[sim_order]
+                sim_R_clean = sim_R_clean[sim_order]
+                rmax = float(np.nanmax(sim_R_clean)) if sim_R_clean.size else 1.0
+                idx = int(np.nanargmax(sim_R_clean)) if sim_R_clean.size else 0
+                t_rmax = float(sim_t_clean[idx]) if sim_t_clean.size else 0.0
+                p_val = float(P_inf) if P_inf is not None else float(self.spin_P_inf.value())
+                rho_val = float(rho) if rho is not None else float(self.spin_rho.value())
+                uc = math.sqrt(p_val / rho_val) if p_val > 0.0 and rho_val > 0.0 else 1.0
+                tc = rmax / uc if uc > 0.0 and rmax > 0.0 else 1.0
+                sim_meta = {"Rmax": rmax, "t_rmax": t_rmax, "tc": tc}
+
+        if self._curve_view_active():
+            self._add_curve_to_view(
+                curve_type=self._infer_curve_type(t, R),
+                t=t,
+                R=R,
+                legend=legend or Path(path).stem,
+            )
+            if sim_t_clean is not None and sim_R_clean is not None:
+                self._add_curve_to_view(
+                    curve_type="simulation",
+                    t=sim_t_clean,
+                    R=sim_R_clean,
+                    legend=f"{legend or Path(path).stem} simulation",
+                    meta=sim_meta,
+                )
+            self.statusBar().showMessage(f"Imported curve(s) into Curve View: {Path(path).name}")
+            self._redraw_all()
+            return
+
+        if self.state.mode == "jobs":
+            raise ValueError("Switch to Simulation or Fitting mode before importing experiment data.")
+
+        self.state.exp_t = t
+        self.state.exp_R = R
+        self.state.exp_path = path
+        self.state.import_metadata = dict(import_metadata or {})
+        self.state.P_inf = P_inf
+        self.state.rho = rho
+        self.state.R_eq = Req
+        self._editing_job_index = None
+        if self.state.mode == "fitting":
+            self.btn_add_job.setText("Add to job list")
+            self.btn_add_job.setToolTip("Add the current fitting setup as a queued job.")
+
+        self.state.sim_t = sim_t_clean
+        self.state.sim_R = sim_R_clean
+        self.state.sim_meta = sim_meta
+        self.state.best_fit_t = None
+        self.state.best_fit_R = None
+        self.state.best_fit_meta = None
+
+        if Req is None and R.size > 0:
+            self.state.R_eq = float(np.mean(R[-min(20, R.size):]))
+        if self.state.R_eq is not None:
+            self.spin_Req_um.setValue(float(self.state.R_eq) * 1e6)
+        if P_inf is not None:
+            self.spin_P_inf.setValue(float(P_inf))
+        if rho is not None:
+            self.spin_rho.setValue(float(rho))
+        if c_long is not None:
+            self.spin_c_long.setValue(float(c_long))
+        if gamma is not None:
+            self.spin_gamma.setValue(float(gamma))
+
+        if t.size > 0:
+            self.spin_t_fit_start.setValue(float(t[0]) * 1e6)
+            self.spin_t_fit_end.setValue(float(t[-1]) * 1e6)
+            if self.chk_fit_window_cycles.isChecked():
+                self._apply_fit_window_cycles()
+
+        self._update_window_title()
+        self.statusBar().showMessage(f"Imported experiment with Import Wizard: {Path(path).name}")
+        self._redraw_all()
+
+    def on_import_wizard(self, path: str | None = None):
+        if not isinstance(path, str):
+            path = None
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import Wizard")
+        dlg.setMinimumSize(820, 620)
+        dlg.setModal(False)
+
+        root = QVBoxLayout(dlg)
+
+        top = QHBoxLayout()
+        left_buttons = QVBoxLayout()
+        btn_import = QPushButton("Import")
+        btn_format = QPushButton("Variable format")
+        btn_format.setCursor(Qt.CursorShape.WhatsThisCursor)
+        btn_format.setStyleSheet(
+            "QPushButton {"
+            "border: 1px solid #666;"
+            "border-radius: 9px;"
+            "padding: 2px 8px;"
+            "background: transparent;"
+            "color: palette(window-text);"
+            "text-align: left;"
+            "}"
+            "QPushButton:hover { background: rgba(255, 255, 255, 0.06); }"
+        )
+        btn_format.setToolTip(
+            "Recommended MAT variables:\n"
+            "- t or t_exp: experimental time in seconds\n"
+            "- R or R_exp: experimental radius in meters\n"
+            "- t_sim / R_sim: simulation curve, if present\n"
+            "- Req, R_eq, or R_equilibrium: equilibrium radius in meters\n"
+            "- legend: curve label string\n"
+            "- P_inf, rho, c_long, gamma: physical constants in SI units"
+        )
+        btn_units = QPushButton("Use um/us")
+        left_buttons.addWidget(btn_import)
+        left_buttons.addWidget(btn_format)
+        left_buttons.addWidget(btn_units)
+        left_buttons.addStretch(1)
+        top.addLayout(left_buttons)
+        drop = _MatDropFrame()
+        drop.setMinimumHeight(92)
+        top.addWidget(drop, stretch=1)
+        root.addLayout(top)
+
+        lbl_path = QLabel("No MAT file loaded.")
+        lbl_path.setWordWrap(True)
+        root.addWidget(lbl_path)
+
+        grp_calibration = QGroupBox("Calibration")
+        cal_layout = QHBoxLayout(grp_calibration)
+        spin_um_per_pixel = _SigFigSpinBox()
+        spin_um_per_pixel.setRange(1e-6, 1e6)
+        spin_um_per_pixel.setDecimals(6)
+        spin_um_per_pixel.setValue(float(self._import_wizard_um_per_pixel))
+        spin_um_per_pixel.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin_um_per_pixel.setToolTip("Radius conversion when R_exp unit is pixel.")
+        spin_fps = _SigFigSpinBox()
+        spin_fps.setRange(1.0, 1e12)
+        spin_fps.setDecimals(3)
+        spin_fps.setValue(float(self._import_wizard_fps))
+        spin_fps.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin_fps.setToolTip("Frame rate used to reconstruct t_exp when no time variable is mapped.")
+        lbl_um_per_pixel = QLabel("um/pixel:")
+        lbl_fps = QLabel("fps:")
+        cal_layout.addWidget(lbl_um_per_pixel)
+        cal_layout.addWidget(spin_um_per_pixel, stretch=1)
+        cal_layout.addSpacing(16)
+        cal_layout.addWidget(lbl_fps)
+        cal_layout.addWidget(spin_fps, stretch=1)
+        root.addWidget(grp_calibration)
+        lbl_converted_preview = QLabel("Converted preview: select R_exp to preview")
+        lbl_converted_preview.setWordWrap(True)
+        root.addWidget(lbl_converted_preview)
+        spin_um_per_pixel.valueChanged.connect(lambda _v: update_converted_preview())
+        spin_fps.valueChanged.connect(lambda _v: update_converted_preview())
+
+        body = QHBoxLayout()
+        grp_arrays = QGroupBox("Curve arrays")
+        arr_form = QFormLayout(grp_arrays)
+        grp_scalars = QGroupBox("Metadata and physical constants")
+        scalar_form = QFormLayout(grp_scalars)
+        body.addWidget(grp_arrays, stretch=1)
+        body.addWidget(grp_scalars, stretch=1)
+        root.addLayout(body, stretch=1)
+
+        grp_cleanup = QGroupBox("Data cleanup")
+        cleanup_layout = QHBoxLayout(grp_cleanup)
+        chk_remove_below = QCheckBox("Remove negative R")
+        chk_remove_below.setChecked(bool(self._import_wizard_remove_below))
+        chk_remove_spikes = QCheckBox("Remove isolated spikes")
+        chk_remove_spikes.setChecked(bool(self._import_wizard_remove_spikes))
+        chk_remove_below.setToolTip("Remove radii below 0 after unit conversion.")
+        spin_spike_threshold = _SigFigSpinBox()
+        spin_spike_threshold.setRange(1.0, 1e6)
+        spin_spike_threshold.setDecimals(6)
+        spin_spike_threshold.setValue(float(self._import_wizard_spike_threshold))
+        spin_spike_threshold.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin_spike_threshold.setToolTip("Spike ratio threshold relative to local median.")
+        cleanup_layout.addWidget(chk_remove_below)
+        cleanup_layout.addWidget(chk_remove_spikes)
+        cleanup_layout.addSpacing(12)
+        cleanup_layout.addWidget(QLabel("spike threshold:"))
+        cleanup_layout.addWidget(spin_spike_threshold, stretch=1)
+        root.addWidget(grp_cleanup)
+
+        btn_apply = QPushButton("Import data")
+        btn_apply.setEnabled(False)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        btn_set_default = QPushButton("Learn names")
+        btn_set_default.setToolTip(
+            "Add the currently selected MAT variable names to the Import Wizard "
+            "recognition list.\n"
+            "Existing names are kept; selected names are tried first next time.\n"
+            "Also saves current calibration and cleanup settings."
+        )
+        btn_reset = QPushButton("Reset names")
+        btn_reset.setToolTip(
+            "Reset Import Wizard variable-name recognition to the built-in defaults."
+        )
+        buttons.addWidget(btn_set_default)
+        buttons.addWidget(btn_reset)
+        buttons.addWidget(btn_apply)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.close)
+        buttons.addWidget(btn_close)
+        root.addLayout(buttons)
+
+        ctx = {"path": "", "flat": {}, "pixel_time_warning_accepted": False}
+        array_rows: dict[str, QComboBox] = {}
+        scalar_rows: dict[str, tuple[QComboBox, QLineEdit]] = {}
+        unit_rows: dict[str, QComboBox] = {}
+        using_micro_units = {"value": False}
+
+        def clear_layout(layout: QFormLayout):
+            while layout.rowCount():
+                layout.removeRow(0)
+
+        def unit_options_for_name(name: str) -> list[str]:
+            if name in ("t_exp", "t_sim", "t_start", "t_end"):
+                return ["s", "us"]
+            if name == "R_exp":
+                return ["m", "um", "pixel"]
+            if name in ("R_sim", "Req", "Rmax"):
+                return ["m", "um"]
+            fixed = {
+                "legend": "",
+                "P_inf": "Pa",
+                "rho": "kg/m^3",
+                "c_long": "m/s",
+                "gamma": "N/m",
+                "LSQErr": "um^2/point",
+            }
+            if name in fixed:
+                return [fixed[name]]
+            model = self._get_active_model()
+            for param in getattr(model, "parameters", []):
+                if param.name == name and param.units:
+                    return [str(param.units[0].label)]
+            return [""]
+
+        def unit_combo_for_name(name: str) -> QComboBox:
+            combo = _NoWheelComboBox()
+            for unit in unit_options_for_name(name):
+                combo.addItem(unit, unit)
+            defaults = {
+                "t_exp": "s",
+                "t_sim": "s",
+                "t_start": "s",
+                "t_end": "s",
+                "R_exp": "m",
+                "R_sim": "m",
+                "Req": "m",
+                "Rmax": "m",
+            }
+            default = self._import_wizard_units.get(name, defaults.get(name))
+            if default:
+                idx = combo.findData(default)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.setMinimumWidth(58)
+            unit_rows[name] = combo
+            return combo
+
+        def unit_label_for_name(name: str) -> QLabel:
+            opts = unit_options_for_name(name)
+            label = QLabel(opts[0] if opts else "")
+            label.setMinimumWidth(64)
+            return label
+
+        def unit_for_preview(name: str) -> str:
+            combo = unit_rows.get(name)
+            if combo is None:
+                opts = unit_options_for_name(name)
+                return opts[0] if opts else ""
+            return str(combo.currentData() or "")
+
+        def to_si(name: str, value):
+            if value is None:
+                return None
+            unit = unit_for_preview(name)
+            if unit == "us":
+                return np.asarray(value, dtype=float) * 1e-6
+            if unit == "um":
+                return np.asarray(value, dtype=float) * 1e-6
+            if unit == "pixel":
+                return np.asarray(value, dtype=float) * float(spin_um_per_pixel.value()) * 1e-6
+            return value
+
+        def display_scalar(name: str, value: float) -> float:
+            unit = unit_for_preview(name)
+            if unit == "um":
+                return float(value) * 1e6
+            if unit == "us":
+                return float(value) * 1e6
+            return float(value)
+
+        def sci3(value: float, unit: str = "") -> str:
+            text = f"{float(value):.2e}"
+            return f"{text} {unit}".rstrip()
+
+        def preview_number(name: str, value: float) -> str:
+            if name in ("Req", "Rmax") and unit_for_preview(name) == "um":
+                return f"{float(value):.3g}"
+            return sci3(value)
+
+        def scalar_preview(name: str, key: str | None) -> str:
+            defaults = {
+                "Req": sci3(float(self.spin_Req_um.value())),
+                "legend": Path(ctx["path"]).stem if ctx["path"] else "",
+                "P_inf": sci3(float(self.spin_P_inf.value())),
+                "rho": sci3(float(self.spin_rho.value())),
+                "c_long": sci3(float(self.spin_c_long.value())),
+                "gamma": sci3(float(self.spin_gamma.value())),
+                "Rmax": "",
+                "t_start": "",
+                "t_end": "",
+                "LSQErr": "",
+            }
+            if not key:
+                return defaults.get(name, "")
+            value = ctx["flat"].get(key)
+            if name == "legend":
+                return self._normalise_legend_text(self._wizard_to_string(value, defaults["legend"]))
+            val = self._wizard_to_float(value, None)
+            return "" if val is None else preview_number(name, display_scalar(name, val))
+
+        def make_scalar_preview_edit() -> QLineEdit:
+            preview = QLineEdit()
+            preview.setToolTip("Editable preview value. Manual edits are used when importing.")
+            return preview
+
+        def update_converted_preview():
+            try:
+                r_combo = array_rows.get("R_exp")
+                if r_combo is None or not r_combo.currentData():
+                    lbl_converted_preview.setText("Converted preview: select R_exp to preview")
+                    return
+                R_raw = self._wizard_to_1d_float(ctx["flat"][r_combo.currentData()])
+                R_si = np.asarray(to_si("R_exp", R_raw), dtype=float)
+                finite_R = R_si[np.isfinite(R_si)]
+                if finite_R.size == 0:
+                    lbl_converted_preview.setText("Converted preview: no finite R_exp values")
+                    return
+                t_combo = array_rows.get("t_exp")
+                if t_combo is not None and t_combo.currentData():
+                    t_raw = self._wizard_to_1d_float(ctx["flat"][t_combo.currentData()])
+                    t_si = np.asarray(to_si("t_exp", t_raw), dtype=float)
+                    t_source = str(t_combo.currentData())
+                else:
+                    fps = float(spin_fps.value())
+                    t_si = np.arange(R_si.size, dtype=float) / fps if fps > 0 else np.array([], dtype=float)
+                    t_source = "fps"
+                n0 = min(R_si.size, t_si.size)
+                if n0 > 0 and (chk_remove_below.isChecked() or chk_remove_spikes.isChecked()):
+                    mask = np.ones(n0, dtype=bool)
+                    R_for_mask = R_si[:n0]
+                    if chk_remove_below.isChecked():
+                        mask &= R_for_mask >= 0.0
+                    if chk_remove_spikes.isChecked() and n0 >= 3:
+                        kernel = min(5, n0 if n0 % 2 == 1 else n0 - 1)
+                        if kernel >= 3:
+                            R_med = medfilt(R_for_mask.astype(float), kernel_size=kernel)
+                            with np.errstate(invalid="ignore", divide="ignore"):
+                                ratio = np.where(R_med > 0, R_for_mask / R_med, 1.0)
+                            mask &= ratio <= float(spin_spike_threshold.value())
+                    R_si = R_si[:n0][mask]
+                    t_si = t_si[:n0][mask]
+                    finite_R = R_si[np.isfinite(R_si)]
+                n = min(R_si.size, t_si.size)
+                if n <= 0:
+                    duration_us = float("nan")
+                else:
+                    t_finite = t_si[:n][np.isfinite(t_si[:n])]
+                    duration_us = (
+                        float(np.nanmax(t_finite) - np.nanmin(t_finite)) * 1e6
+                        if t_finite.size
+                        else float("nan")
+                    )
+                rmax_um = float(np.nanmax(finite_R)) * 1e6
+                lbl_converted_preview.setText(
+                    f"Converted preview: n = {n} | Rmax = {rmax_um:.3g} um | "
+                    f"duration = {duration_us:.3g} us | t source = {t_source}"
+                )
+            except Exception as exc:
+                lbl_converted_preview.setText(f"Converted preview: {exc}")
+
+        chk_remove_below.stateChanged.connect(lambda _v: update_converted_preview())
+        chk_remove_spikes.stateChanged.connect(lambda _v: update_converted_preview())
+        spin_spike_threshold.valueChanged.connect(lambda _v: update_converted_preview())
+
+        def rebuild_for_path(path: str):
+            mat = self._wizard_load_mat(path)
+            flat = {
+                key: value for key, value in self._wizard_flatten_namespace(mat).items()
+                if not str(key).startswith("__")
+            }
+            keys = sorted(flat.keys(), key=str.lower)
+            ctx["path"] = path
+            ctx["flat"] = flat
+            lbl_path.setText(path)
+            clear_layout(arr_form)
+            clear_layout(scalar_form)
+            array_rows.clear()
+            scalar_rows.clear()
+            unit_rows.clear()
+
+            array_specs = [
+                ("t_exp", self._import_wizard_keywords["t_exp"]),
+                ("R_exp", self._import_wizard_keywords["R_exp"]),
+                ("t_sim", self._import_wizard_keywords["t_sim"]),
+                ("R_sim", self._import_wizard_keywords["R_sim"]),
+                ("legend", self._import_wizard_keywords["legend"]),
+                ("Req", self._import_wizard_keywords["Req"]),
+                ("Rmax", self._import_wizard_keywords["Rmax"]),
+            ]
+            array_keys = [key for key in keys if self._wizard_is_numeric_array(flat[key])]
+            for i, (label, candidates) in enumerate(array_specs):
+                if i == 4:
+                    line = QFrame()
+                    line.setFrameShape(QFrame.Shape.HLine)
+                    line.setFrameShadow(QFrame.Shadow.Sunken)
+                    arr_form.addRow(line)
+                if label == "legend":
+                    combo = self._wizard_combo(keys, candidates, scalar_only=False, flat=flat)
+                    preview = make_scalar_preview_edit()
+                    preview.setText(scalar_preview(label, combo.currentData()))
+                    combo.currentIndexChanged.connect(
+                        functools.partial(
+                            lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                            nm=label,
+                            cb=combo,
+                            pv=preview,
+                        )
+                    )
+                    scalar_rows[label] = (combo, preview)
+                    row = QHBoxLayout()
+                    row.addWidget(combo, stretch=9)
+                    row.addWidget(preview, stretch=8)
+                    arr_form.addRow(f"{label}:", row)
+                elif label in ("Req", "Rmax"):
+                    combo = self._wizard_combo(keys, candidates, scalar_only=True, flat=flat)
+                    preview = make_scalar_preview_edit()
+                    preview.setText(scalar_preview(label, combo.currentData()))
+                    combo.currentIndexChanged.connect(
+                        functools.partial(
+                            lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                            nm=label,
+                            cb=combo,
+                            pv=preview,
+                        )
+                    )
+                    scalar_rows[label] = (combo, preview)
+                    row = QHBoxLayout()
+                    row.addWidget(combo, stretch=2)
+                    unit = unit_combo_for_name(label)
+                    row.addWidget(unit)
+                    row.addWidget(preview, stretch=1)
+                    unit.currentIndexChanged.connect(
+                        functools.partial(
+                            lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                            nm=label,
+                            cb=combo,
+                            pv=preview,
+                        )
+                    )
+                    arr_form.addRow(f"{label}:", row)
+                else:
+                    combo = self._wizard_combo(array_keys, candidates)
+                    array_rows[label] = combo
+                    combo.currentIndexChanged.connect(lambda _idx: update_converted_preview())
+                    row = QHBoxLayout()
+                    row.addWidget(combo, stretch=1)
+                    unit = unit_combo_for_name(label)
+                    row.addWidget(unit)
+                    unit.currentIndexChanged.connect(lambda _idx: update_converted_preview())
+                    arr_form.addRow(f"{label}:", row)
+
+            def sync_fps_enabled():
+                enabled = array_rows.get("t_exp") is not None and not array_rows["t_exp"].currentData()
+                spin_fps.setEnabled(bool(enabled))
+                lbl_fps.setEnabled(bool(enabled))
+
+            if "t_exp" in array_rows:
+                array_rows["t_exp"].currentIndexChanged.connect(lambda _idx: (sync_fps_enabled(), update_converted_preview()))
+            sync_fps_enabled()
+
+            scalar_specs = [
+                ("P_inf", self._import_wizard_keywords["P_inf"]),
+                ("rho", self._import_wizard_keywords["rho"]),
+                ("c_long", self._import_wizard_keywords["c_long"]),
+                ("gamma", self._import_wizard_keywords["gamma"]),
+                ("t_start", self._import_wizard_keywords["t_start"]),
+                ("t_end", self._import_wizard_keywords["t_end"]),
+                ("LSQErr", self._import_wizard_keywords["LSQErr"]),
+            ]
+            for label, candidates in scalar_specs:
+                combo = self._wizard_combo(keys, candidates, scalar_only=(label != "legend"), flat=flat)
+                preview = make_scalar_preview_edit()
+                preview.setText(scalar_preview(label, combo.currentData()))
+                combo.currentIndexChanged.connect(
+                    functools.partial(
+                        lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                        nm=label,
+                        cb=combo,
+                        pv=preview,
+                    )
+                )
+                scalar_rows[label] = (combo, preview)
+                row = QHBoxLayout()
+                row.addWidget(combo, stretch=2)
+                row.addWidget(preview, stretch=1)
+                row.addWidget(unit_label_for_name(label))
+                scalar_form.addRow(f"{label}:", row)
+
+            btn_apply.setEnabled(True)
+            update_converted_preview()
+
+        def choose_file():
+            path, _ = QFileDialog.getOpenFileName(dlg, "Import MAT file", "", "MAT files (*.mat)")
+            if path:
+                try:
+                    rebuild_for_path(path)
+                except Exception as exc:
+                    QMessageBox.critical(dlg, "Import failed", f"{exc}\n\n{traceback.format_exc()}")
+
+        def dropped_file(path: str):
+            try:
+                rebuild_for_path(path)
+            except Exception as exc:
+                QMessageBox.critical(dlg, "Import failed", f"{exc}\n\n{traceback.format_exc()}")
+
+        def selected_array(name: str) -> np.ndarray | None:
+            key = array_rows[name].currentData()
+            if not key:
+                return None
+            arr = self._wizard_to_1d_float(ctx["flat"][key])
+            return np.asarray(to_si(name, arr), dtype=float)
+
+        def apply_cleanup(t_arr: np.ndarray, R_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            t_clean = np.asarray(t_arr, dtype=float).reshape(-1)
+            R_clean = np.asarray(R_arr, dtype=float).reshape(-1)
+            if t_clean.shape[0] != R_clean.shape[0]:
+                return t_clean, R_clean
+            mask = np.ones(R_clean.shape[0], dtype=bool)
+            if chk_remove_below.isChecked():
+                mask &= R_clean >= 0.0
+            if chk_remove_spikes.isChecked() and R_clean.size >= 3:
+                kernel = min(5, R_clean.size if R_clean.size % 2 == 1 else R_clean.size - 1)
+                if kernel >= 3:
+                    R_med = medfilt(R_clean.astype(float), kernel_size=kernel)
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        ratio = np.where(R_med > 0, R_clean / R_med, 1.0)
+                    mask &= ratio <= float(spin_spike_threshold.value())
+            return t_clean[mask], R_clean[mask]
+
+        def selected_scalar(name: str):
+            combo, preview = scalar_rows[name]
+            text = preview.text().strip()
+            if name == "legend":
+                return self._normalise_legend_text(text) if text else None
+            if text:
+                try:
+                    val = float(text.replace(",", ""))
+                except ValueError as exc:
+                    raise ValueError(f"{name} preview value must be numeric.") from exc
+            else:
+                key = combo.currentData()
+                if not key:
+                    return None
+                val = self._wizard_to_float(ctx["flat"][key], None)
+            converted = to_si(name, val)
+            if converted is None:
+                return None
+            try:
+                return float(np.asarray(converted).reshape(-1)[0])
+            except Exception:
+                return converted
+
+        def apply_import():
+            try:
+                path = str(ctx["path"])
+                has_time_mapping = bool(array_rows.get("t_exp") and array_rows["t_exp"].currentData())
+                if (
+                    has_time_mapping
+                    and unit_for_preview("R_exp") == "pixel"
+                    and not ctx.get("pixel_time_warning_accepted", False)
+                ):
+                    reply = QMessageBox.warning(
+                        dlg,
+                        "Check R_exp unit",
+                        "A time-axis variable is selected, but R_exp is set to pixel.\n\n"
+                        "If this file already contains physical radius values, choose m or um "
+                        "instead. Continue importing with pixel-to-um conversion?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                    ctx["pixel_time_warning_accepted"] = True
+                t = selected_array("t_exp")
+                R = selected_array("R_exp")
+                if t is None or R is None:
+                    if R is None:
+                        raise ValueError("Please map R_exp before importing.")
+                    fps = float(spin_fps.value())
+                    if not np.isfinite(fps) or fps <= 0:
+                        raise ValueError("fps must be positive to reconstruct t_exp.")
+                    t = np.arange(R.shape[0], dtype=float) / fps
+                if t.shape[0] != R.shape[0]:
+                    raise ValueError(f"t_exp and R_exp length mismatch: {t.shape[0]} vs {R.shape[0]}.")
+                t, R = apply_cleanup(t, R)
+                legend = selected_scalar("legend") or Path(path).stem
+                t_sim = selected_array("t_sim")
+                R_sim = selected_array("R_sim")
+                t_key = array_rows["t_exp"].currentData() or ""
+                R_key = array_rows["R_exp"].currentData() or ""
+                import_meta = {
+                    "method": "import_wizard",
+                    "source_path": path,
+                    "t_key": str(t_key),
+                    "R_key": str(R_key),
+                    "t_unit": unit_for_preview("t_exp"),
+                    "R_unit": unit_for_preview("R_exp"),
+                    "used_fps": not bool(t_key),
+                    "fps": float(spin_fps.value()),
+                    "um_per_pixel": float(spin_um_per_pixel.value()),
+                    "remove_negative_R": bool(chk_remove_below.isChecked()),
+                    "remove_isolated_spikes": bool(chk_remove_spikes.isChecked()),
+                    "spike_threshold": float(spin_spike_threshold.value()),
+                }
+                self._apply_import_wizard_experiment(
+                    path=path,
+                    t=t,
+                    R=R,
+                    legend=str(legend),
+                    Req=selected_scalar("Req"),
+                    P_inf=selected_scalar("P_inf"),
+                    rho=selected_scalar("rho"),
+                    c_long=selected_scalar("c_long"),
+                    gamma=selected_scalar("gamma"),
+                    t_sim=t_sim,
+                    R_sim=R_sim,
+                    import_metadata=import_meta,
+                )
+                dlg.close()
+            except Exception as exc:
+                QMessageBox.critical(dlg, "Import failed", f"{exc}\n\n{traceback.format_exc()}")
+
+        def current_keyword_defaults() -> dict[str, list[str]]:
+            updated = self._normalise_import_wizard_keywords(self._import_wizard_keywords)
+            for name, combo in array_rows.items():
+                selected = combo.currentData()
+                if not selected:
+                    continue
+                current = updated.get(name, [])
+                updated[name] = [str(selected)] + [v for v in current if v != str(selected)]
+            for name, (combo, _preview) in scalar_rows.items():
+                selected = combo.currentData()
+                if not selected:
+                    continue
+                current = updated.get(name, [])
+                updated[name] = [str(selected)] + [v for v in current if v != str(selected)]
+            return updated
+
+        def set_wizard_defaults():
+            self._import_wizard_keywords = current_keyword_defaults()
+            self._import_wizard_units = self._normalise_import_wizard_units({
+                name: str(combo.currentData() or "")
+                for name, combo in unit_rows.items()
+            })
+            self._import_wizard_um_per_pixel = float(spin_um_per_pixel.value())
+            self._import_wizard_fps = float(spin_fps.value())
+            self._import_wizard_remove_below = bool(chk_remove_below.isChecked())
+            self._import_wizard_remove_spikes = bool(chk_remove_spikes.isChecked())
+            self._import_wizard_spike_threshold = float(spin_spike_threshold.value())
+            self._save_settings()
+            self.statusBar().showMessage("Import Wizard keywords saved as default.")
+
+        def reset_wizard_defaults():
+            self._import_wizard_keywords = self._normalise_import_wizard_keywords({})
+            self._import_wizard_units = self._normalise_import_wizard_units({})
+            self._import_wizard_um_per_pixel = 3.2
+            self._import_wizard_fps = 1_000_000.0
+            self._import_wizard_remove_below = False
+            self._import_wizard_remove_spikes = False
+            self._import_wizard_spike_threshold = 2.0
+            spin_um_per_pixel.setValue(float(self._import_wizard_um_per_pixel))
+            spin_fps.setValue(float(self._import_wizard_fps))
+            chk_remove_below.setChecked(bool(self._import_wizard_remove_below))
+            chk_remove_spikes.setChecked(bool(self._import_wizard_remove_spikes))
+            spin_spike_threshold.setValue(float(self._import_wizard_spike_threshold))
+            self._save_settings()
+            if ctx["path"]:
+                try:
+                    rebuild_for_path(str(ctx["path"]))
+                except Exception as exc:
+                    QMessageBox.critical(dlg, "Import failed", f"{exc}\n\n{traceback.format_exc()}")
+            self.statusBar().showMessage("Import Wizard keywords reset.")
+
+        btn_import.clicked.connect(choose_file)
+        drop.fileDropped.connect(dropped_file)
+        btn_apply.clicked.connect(apply_import)
+        btn_set_default.clicked.connect(set_wizard_defaults)
+        btn_reset.clicked.connect(reset_wizard_defaults)
+
+        def toggle_micro_units():
+            using_micro_units["value"] = not using_micro_units["value"]
+            target = {
+                "t_exp": "us",
+                "t_sim": "us",
+                "R_exp": "um",
+                "R_sim": "um",
+                "Req": "um",
+                "Rmax": "um",
+            } if using_micro_units["value"] else {
+                "t_exp": "s",
+                "t_sim": "s",
+                "R_exp": "m",
+                "R_sim": "m",
+                "Req": "m",
+                "Rmax": "m",
+            }
+            for name, unit in target.items():
+                combo = unit_rows.get(name)
+                if combo is None:
+                    continue
+                idx = combo.findData(unit)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            btn_units.setText("Use SI units" if using_micro_units["value"] else "Use um/us")
+
+        btn_units.clicked.connect(toggle_micro_units)
+
+        self._import_wizard_dialog = dlg
+        if path:
+            try:
+                rebuild_for_path(path)
+            except Exception as exc:
+                QMessageBox.critical(dlg, "Import failed", f"{exc}\n\n{traceback.format_exc()}")
+        dlg.show()
+
+    # =====================================================================
     # load experiment
     # =====================================================================
 
@@ -3934,10 +5178,21 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            exp = load_experiment_mat(path)
+            try:
+                exp = self._load_experiment_with_import_defaults(
+                    path,
+                    confirm_units=True,
+                    parent=self,
+                    accepted_state={},
+                )
+            except RuntimeError:
+                return
+            except Exception:
+                exp = load_experiment_mat(path)
             self.state.exp_t = exp.t
             self.state.exp_R = exp.R
             self.state.exp_path = exp.source_path
+            self.state.import_metadata = getattr(exp, "import_metadata", None)
             self.state.P_inf = exp.P_inf
             self.state.rho = exp.rho
             self.state.R_eq = exp.R_eq
@@ -4027,11 +5282,25 @@ class MainWindow(QMainWindow):
                 if reply == QMessageBox.StandardButton.Yes:
                     self._load_params_from_path(path)
             else:
-                QMessageBox.critical(
-                    self, "Load failed", f"{e}\n\n{traceback.format_exc()}"
+                reply = QMessageBox.question(
+                    self,
+                    "Load failed",
+                    f"{e}\n\nOpen Import Wizard to map variables manually?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
                 )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.on_import_wizard(path)
         except Exception as e:
-            QMessageBox.critical(self, "Load failed", f"{e}\n\n{traceback.format_exc()}")
+            reply = QMessageBox.question(
+                self,
+                "Load failed",
+                f"{e}\n\nOpen Import Wizard to map variables manually?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.on_import_wizard(path)
 
     # =====================================================================
     # job queue
@@ -4214,6 +5483,7 @@ class MainWindow(QMainWindow):
         exp_P_inf: float | None,
         exp_rho: float | None,
         exp_R_eq: float | None,
+        exp_import_metadata: dict | None = None,
         fit_flags: dict[str, bool],
         scales: dict[str, str],
         bounds_si: dict[str, tuple[float, float]],
@@ -4255,6 +5525,7 @@ class MainWindow(QMainWindow):
                 "P_inf": exp_P_inf,
                 "rho": exp_rho,
                 "R_eq": exp_R_eq,
+                "import_metadata": dict(exp_import_metadata or {}),
             },
             "model": model_key,
             "solver_entrypoint": self._plugin_entrypoint_for_model(model_key),
@@ -4335,6 +5606,7 @@ class MainWindow(QMainWindow):
             exp_P_inf=self.state.P_inf,
             exp_rho=self.state.rho,
             exp_R_eq=self.state.R_eq,
+            exp_import_metadata=self.state.import_metadata,
             fit_flags=fit_flags,
             scales=scales,
             bounds_si=bounds_si,
@@ -4357,6 +5629,7 @@ class MainWindow(QMainWindow):
             exp_P_inf=self.state.P_inf,
             exp_rho=self.state.rho,
             exp_R_eq=self.state.R_eq,
+            exp_import_metadata=self.state.import_metadata,
         )
         if job is None:
             QMessageBox.warning(self, "Cannot add job", error or "Could not build simulation job.")
@@ -4372,6 +5645,7 @@ class MainWindow(QMainWindow):
         exp_P_inf: float | None,
         exp_rho: float | None,
         exp_R_eq: float | None,
+        exp_import_metadata: dict | None = None,
     ) -> tuple[dict | None, str | None]:
         model_key = self._get_active_model_key()
         has_exp = exp_t is not None and exp_R is not None
@@ -4412,6 +5686,7 @@ class MainWindow(QMainWindow):
                 "P_inf": exp_P_inf,
                 "rho": exp_rho,
                 "R_eq": exp_R_eq,
+                "import_metadata": dict(exp_import_metadata or {}),
             },
             "model": model_key,
             "solver_entrypoint": self._plugin_entrypoint_for_model(model_key),
@@ -4525,6 +5800,7 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.setValue(0)
         try:
+            import_unit_warning_state: dict = {}
             for i, path in enumerate(paths, start=1):
                 progress.setLabelText(f"Loading {i}/{len(paths)}: {Path(path).name}")
                 progress.setValue(i - 1)
@@ -4539,7 +5815,18 @@ class MainWindow(QMainWindow):
                         added.append(result_job)
                         continue
 
-                    exp = load_experiment_mat(path)
+                    try:
+                        exp = self._load_experiment_with_import_defaults(
+                            path,
+                            confirm_units=True,
+                            parent=self,
+                            accepted_state=import_unit_warning_state,
+                        )
+                    except RuntimeError:
+                        skipped.append(f"{Path(path).name}: import cancelled by user")
+                        continue
+                    except Exception:
+                        exp = load_experiment_mat(path)
                     exp_R_eq = exp.R_eq
                     if exp_R_eq is None and exp.R.size > 0:
                         exp_R_eq = float(np.mean(exp.R[-min(20, exp.R.size):]))
@@ -4553,6 +5840,7 @@ class MainWindow(QMainWindow):
                             exp_P_inf=exp.P_inf,
                             exp_rho=exp.rho,
                             exp_R_eq=exp_R_eq,
+                            exp_import_metadata=getattr(exp, "import_metadata", None),
                             fit_flags=fit_flags,
                             scales=scales,
                             bounds_si=bounds_si,
@@ -4566,6 +5854,7 @@ class MainWindow(QMainWindow):
                             exp_P_inf=exp.P_inf,
                             exp_rho=exp.rho,
                             exp_R_eq=exp_R_eq,
+                            exp_import_metadata=getattr(exp, "import_metadata", None),
                         )
                     if job is None:
                         skipped.append(f"{Path(path).name}: {error or 'could not build job'}")
@@ -7027,6 +8316,12 @@ class MainWindow(QMainWindow):
                 export["fit_window_t_start_s"] = float(t0)
                 export["fit_window_t_end_s"] = float(t1)
                 export["fit_window_n_points"] = int(np.count_nonzero((t_exp >= t0) & (t_exp <= t1)))
+                import_meta = getattr(self.state, "import_metadata", None)
+                if import_meta:
+                    safe_meta = self._json_safe(import_meta)
+                    export["struct_import"] = {
+                        str(key): value for key, value in safe_meta.items()
+                    }
 
             # --- parameters (same struct format as Save parameters) ---
             names  = list(self._param_rows.keys())
