@@ -4726,7 +4726,7 @@ class MainWindow(QMainWindow):
 
         def scalar_preview(name: str, key: str | None) -> str:
             defaults = {
-                "Req": sci3(float(self.spin_Req_um.value())),
+                "Req": "",
                 "legend": Path(ctx["path"]).stem if ctx["path"] else "",
                 "P_inf": sci3(float(self.spin_P_inf.value())),
                 "rho": sci3(float(self.spin_rho.value())),
@@ -4748,7 +4748,17 @@ class MainWindow(QMainWindow):
         def make_scalar_preview_edit() -> QLineEdit:
             preview = QLineEdit()
             preview.setToolTip("Editable preview value. Manual edits are used when importing.")
+            preview.setProperty("manual_edited", False)
+            preview.textEdited.connect(lambda _text, pv=preview: pv.setProperty("manual_edited", True))
             return preview
+
+        def set_scalar_preview_text(name: str, combo: QComboBox, preview: QLineEdit):
+            preview.setText(scalar_preview(name, combo.currentData()))
+            if name == "Req" and not combo.currentData():
+                preview.setPlaceholderText("auto from R")
+            else:
+                preview.setPlaceholderText("")
+            preview.setProperty("manual_edited", False)
 
         def update_converted_preview():
             try:
@@ -4786,7 +4796,8 @@ class MainWindow(QMainWindow):
                             mask &= ratio <= float(spin_spike_threshold.value())
                     R_si = R_si[:n0][mask]
                     t_si = t_si[:n0][mask]
-                    finite_R = R_si[np.isfinite(R_si)]
+                R_preview = R_si[:min(R_si.size, t_si.size)]
+                finite_R = R_preview[np.isfinite(R_preview)]
                 n = min(R_si.size, t_si.size)
                 if n <= 0:
                     duration_us = float("nan")
@@ -4798,8 +4809,10 @@ class MainWindow(QMainWindow):
                         else float("nan")
                     )
                 rmax_um = float(np.nanmax(finite_R)) * 1e6
+                req_um = float(np.mean(finite_R[-min(20, finite_R.size):])) * 1e6
                 lbl_converted_preview.setText(
                     f"Converted preview: n = {n} | Rmax = {rmax_um:.3g} um | "
+                    f"Req = {req_um:.3g} um | "
                     f"duration = {duration_us:.3g} us | t source = {t_source}"
                 )
             except Exception as exc:
@@ -4844,10 +4857,10 @@ class MainWindow(QMainWindow):
                 if label == "legend":
                     combo = self._wizard_combo(keys, candidates, scalar_only=False, flat=flat)
                     preview = make_scalar_preview_edit()
-                    preview.setText(scalar_preview(label, combo.currentData()))
+                    set_scalar_preview_text(label, combo, preview)
                     combo.currentIndexChanged.connect(
                         functools.partial(
-                            lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                            lambda _idx, nm, cb, pv: (set_scalar_preview_text(nm, cb, pv), update_converted_preview()),
                             nm=label,
                             cb=combo,
                             pv=preview,
@@ -4861,10 +4874,10 @@ class MainWindow(QMainWindow):
                 elif label in ("Req", "Rmax"):
                     combo = self._wizard_combo(keys, candidates, scalar_only=True, flat=flat)
                     preview = make_scalar_preview_edit()
-                    preview.setText(scalar_preview(label, combo.currentData()))
+                    set_scalar_preview_text(label, combo, preview)
                     combo.currentIndexChanged.connect(
                         functools.partial(
-                            lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                            lambda _idx, nm, cb, pv: (set_scalar_preview_text(nm, cb, pv), update_converted_preview()),
                             nm=label,
                             cb=combo,
                             pv=preview,
@@ -4878,7 +4891,7 @@ class MainWindow(QMainWindow):
                     row.addWidget(preview, stretch=1)
                     unit.currentIndexChanged.connect(
                         functools.partial(
-                            lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                            lambda _idx, nm, cb, pv: (set_scalar_preview_text(nm, cb, pv), update_converted_preview()),
                             nm=label,
                             cb=combo,
                             pv=preview,
@@ -4917,10 +4930,10 @@ class MainWindow(QMainWindow):
             for label, candidates in scalar_specs:
                 combo = self._wizard_combo(keys, candidates, scalar_only=(label != "legend"), flat=flat)
                 preview = make_scalar_preview_edit()
-                preview.setText(scalar_preview(label, combo.currentData()))
+                set_scalar_preview_text(label, combo, preview)
                 combo.currentIndexChanged.connect(
                     functools.partial(
-                        lambda _idx, nm, cb, pv: (pv.setText(scalar_preview(nm, cb.currentData())), update_converted_preview()),
+                        lambda _idx, nm, cb, pv: (set_scalar_preview_text(nm, cb, pv), update_converted_preview()),
                         nm=label,
                         cb=combo,
                         pv=preview,
@@ -4976,9 +4989,13 @@ class MainWindow(QMainWindow):
 
         def selected_scalar(name: str):
             combo, preview = scalar_rows[name]
+            key = combo.currentData()
+            manual_edited = bool(preview.property("manual_edited"))
             text = preview.text().strip()
             if name == "legend":
                 return self._normalise_legend_text(text) if text else None
+            if name == "Req" and not key and not manual_edited:
+                return None
             if text:
                 try:
                     val = float(text.replace(",", ""))

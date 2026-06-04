@@ -181,6 +181,16 @@ The main window title should read `IMR Fitting GUI (beta 1.2)`.
 
 ---
 
+## Tutorials
+
+Step-by-step tutorials are available in [docs/README.md](docs/README.md).
+
+Current tutorial topics include:
+
+- [Import experiment data](docs/tutorials/import-data.md)
+
+---
+
 ## Environment Notes
 
 - `.venv/`, `venv/`, and `env/` are ignored by git.
@@ -322,3 +332,9 @@ test/                       # Test MAT files
 - Solvers use `scipy.solve_ivp` with the BDF method and sparse Jacobian (SuperLU) for stiff bubble dynamics.
 - GMOD1 and GMOD2 are independent constitutive models with separate parameter sets, solvers, and JSON descriptors.
 - Parallel fitting uses `multiprocessing` (not threads) to bypass the Python GIL. On Windows, the entry point `python -m imr_gui` includes the required `freeze_support()` guard.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
