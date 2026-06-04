@@ -33,6 +33,7 @@ LLM_KNOWLEDGE_BASE.md
 # Demo
 IMR_fitting_GUI_DEMO/
 Latex/
+docs/tutorials/media/README.md
 
 # settings for development
 .claude/

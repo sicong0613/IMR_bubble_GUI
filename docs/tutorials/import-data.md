@@ -4,7 +4,7 @@ This tutorial shows how to import an experiment `.mat` file into IMR Fitting GUI
 
 ## Standard MAT Import
 
-[Watch demo](media/import_data_1_wizard.mp4)
+[Watch demo](https://raw.githubusercontent.com/sicong0613/IMR_bubble_GUI/main/docs/tutorials/media/import_data_1_wizard.mp4)
 
 1. Open `File -> Import Wizard...`.
 2. Click `Import` or drag a `.mat` file into the drop area.
@@ -22,7 +22,7 @@ This tutorial shows how to import an experiment `.mat` file into IMR Fitting GUI
 6. If the file has no time-axis variable, leave `t_exp` as `(none)` and enter the camera `fps`.
 7. Click `Import data`.
 
-[Watch demo](media/import_data_2.mp4)
+[Watch demo](https://raw.githubusercontent.com/sicong0613/IMR_bubble_GUI/main/docs/tutorials/media/import_data_2.mp4)
 
 ## Notes
 
