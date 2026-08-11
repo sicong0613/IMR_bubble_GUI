@@ -1,19 +1,22 @@
-# IMR Fitting GUI Tutorials
+# IMRFit Tutorials
 
-This folder contains short, task-based tutorials for IMR Fitting GUI.
+This folder contains short, task-based tutorials for IMRFit.
 
 Each tutorial is designed to pair a few written steps with a short MP4 demo. For best readability, keep each video focused on one workflow.
 
 ## Basic Workflow
 
 1. [Import experiment data](tutorials/import-data.md)
-2. Set fitting window
-3. Run fitting
-4. Export results
+2. Select correct constitutional model
+3. Modify, save and import model parameters
+3. Run Simulation and set fitting window
+4. Change to fitting module, run fitting
+5. Export results
 
 ## Job List Workflow
 
-1. Add jobs
+1. Add jobs from preview panel
+2. Batch add jobs
 2. Run queue
 3. Import/export job queues
 4. Export job results
@@ -29,4 +32,3 @@ Each tutorial is designed to pair a few written steps with a short MP4 demo. For
 1. Add a user constitutive model
 2. Write a user solver
 3. Test the plugin in the GUI
-

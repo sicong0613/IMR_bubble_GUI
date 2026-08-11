@@ -7,6 +7,7 @@ __pycache__/
 需求*.txt
 说明*.txt
 .python-version
+todo.md
 
 # PyInstaller
 build/
@@ -21,6 +22,20 @@ dist/
 *.toc
 *.fls
 *.fdb_latexmk
+
+# Local JOSS paper LaTeX draft (final JOSS submission uses paper.md)
+paper/draft_JOSS_md.tex
+paper/draft_JOSS_md.aux
+paper/draft_JOSS_md.bbl
+paper/draft_JOSS_md.blg
+paper/draft_JOSS_md.fdb_latexmk
+paper/draft_JOSS_md.fls
+paper/draft_JOSS_md.log
+paper/draft_JOSS_md.out
+paper/draft_JOSS_md.pdf
+paper/draft_JOSS_md.spl
+paper/draft_JOSS_md.synctex.gz
+paper/paper.bib
 
 # Runtime settings (written by the app on first run)
 imr_gui/settings.json

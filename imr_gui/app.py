@@ -535,7 +535,7 @@ class FitWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    APP_TITLE = "IMR Fitting GUI (beta 1.2)"
+    APP_TITLE = "IMRFit (beta 1.3)"
     PARAM_INHERIT_ALIASES: dict[str, dict[str, str]] = {
         "GMOD1": {
             "GA": "GA1",
@@ -565,6 +565,7 @@ class MainWindow(QMainWindow):
         "t_start": ["t_start", "fit_window_start"],
         "t_end": ["t_end", "fit_window_end"],
         "LSQErr": ["LSQErr", "lsqerr", "loss"],
+        "parameters": ["struct_best_fit"],
     }
     DEFAULT_IMPORT_WIZARD_UNITS = {
         "t_exp": "s",
@@ -630,6 +631,7 @@ class MainWindow(QMainWindow):
         self._curve_color_mode: str = "distinct"
         self._selected_curve_indices: set[int] = set()
         self._curve_selection_anchor: int | None = None
+        self._warned_curve_view_multi_exp_req: bool = False
         self._import_wizard_keywords: dict[str, list[str]] = self._normalise_import_wizard_keywords({})
         self._import_wizard_units: dict[str, str] = dict(self.DEFAULT_IMPORT_WIZARD_UNITS)
         self._import_wizard_um_per_pixel: float = 3.2
@@ -778,14 +780,28 @@ class MainWindow(QMainWindow):
         exp_box = QGroupBox("Experiment")
         exp_lay = QVBoxLayout(exp_box)
 
-        row_req = QHBoxLayout()
-        row_req.addWidget(QLabel("Req (µm)"))
+        row_req = QGridLayout()
+        row_req.setContentsMargins(0, 0, 0, 0)
+        row_req.setHorizontalSpacing(6)
+        row_req.addWidget(QLabel("Req_sim (um)"), 0, 0)
         self.spin_Req_um = _NoWheelSpinBox()
         self.spin_Req_um.setRange(0.001, 1e6)
         self.spin_Req_um.setDecimals(6)
         self.spin_Req_um.setValue(30.0)
         self.spin_Req_um.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        row_req.addWidget(self.spin_Req_um, stretch=1)
+        self.spin_Req_um.setToolTip("Equilibrium radius used by simulation and fitting.")
+        row_req.addWidget(self.spin_Req_um, 0, 1)
+        row_req.addWidget(QLabel("Req_exp (um)"), 0, 2)
+        self.spin_Req_exp_um = _NoWheelSpinBox()
+        self.spin_Req_exp_um.setRange(0.001, 1e6)
+        self.spin_Req_exp_um.setDecimals(6)
+        self.spin_Req_exp_um.setValue(30.0)
+        self.spin_Req_exp_um.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_Req_exp_um.setToolTip("Equilibrium radius used to normalize the current experimental curve.")
+        self.spin_Req_exp_um.valueChanged.connect(self._on_req_exp_changed)
+        row_req.addWidget(self.spin_Req_exp_um, 0, 3)
+        row_req.setColumnStretch(1, 1)
+        row_req.setColumnStretch(3, 1)
         exp_lay.addLayout(row_req)
 
         row_tspan = QHBoxLayout()
@@ -1572,6 +1588,128 @@ class MainWindow(QMainWindow):
                 return "simulation"
         return "experiment"
 
+    def _current_R_eq_m(self) -> float:
+        if hasattr(self, "spin_Req_exp_um"):
+            return float(self.spin_Req_exp_um.value()) * 1e-6
+        return float(self.spin_Req_um.value()) * 1e-6
+
+    def _current_sim_R_eq_m(self) -> float:
+        return float(self.spin_Req_um.value()) * 1e-6
+
+    def _on_req_exp_changed(self, value_um: float):
+        self.state.R_eq = float(value_um) * 1e-6
+        if self.state.view_mode == "normalized":
+            self._redraw_all()
+
+    def _set_req_controls_from_exp(self, r_eq_m: float, *, update_sim: bool = True):
+        r_eq_um = float(r_eq_m) * 1e6
+        if update_sim:
+            self.spin_Req_um.setValue(r_eq_um)
+        if hasattr(self, "spin_Req_exp_um"):
+            self.spin_Req_exp_um.setValue(r_eq_um)
+        self.state.R_eq = float(r_eq_m)
+
+    def _lsqerr_ref_radius_m(self, job: dict | None = None) -> float:
+        if job is not None:
+            exp = job.get("experiment", {}) or {}
+            r_eq = exp.get("R_eq", None)
+            if r_eq is not None and np.isfinite(float(r_eq)) and float(r_eq) > 0.0:
+                return float(r_eq)
+            settings = job.get("experiment_settings", {}) or {}
+            req_um = settings.get("Req_um", None)
+            if req_um is not None and np.isfinite(float(req_um)) and float(req_um) > 0.0:
+                return float(req_um) * 1e-6
+        return self._current_R_eq_m()
+
+    def _format_lsqerr_display(self, lsq_err: float, ref_radius_m: float | None = None, precision: str = ".4e") -> str:
+        value = float(lsq_err)
+        text = f"LSQErr={value:{precision}} um^2/point"
+        if ref_radius_m is None:
+            ref_radius_m = self._current_R_eq_m()
+        try:
+            ref_um = float(ref_radius_m) * 1e6
+            if np.isfinite(value) and value >= 0.0 and np.isfinite(ref_um) and ref_um > 0.0:
+                rmse_percent = math.sqrt(value) / ref_um * 100.0
+                text += f" | RMSE*={rmse_percent:.3g} %/point"
+        except Exception:
+            pass
+        return text
+
+    def _curve_normalization_context(self, curve: dict | None = None) -> tuple[float, float, float]:
+        curve = curve or {}
+        meta = dict(curve.get("meta", {}) or {})
+
+        r_eq = curve.get("R_eq", meta.get("R_eq", meta.get("Req", None)))
+        if r_eq is None or not np.isfinite(float(r_eq)) or float(r_eq) <= 0.0:
+            r_eq = self._current_R_eq_m()
+
+        p_inf = curve.get("P_inf", meta.get("P_inf", None))
+        if p_inf is None or not np.isfinite(float(p_inf)) or float(p_inf) <= 0.0:
+            p_inf = self.state.P_inf
+        if p_inf is None or not np.isfinite(float(p_inf)) or float(p_inf) <= 0.0:
+            p_inf = float(self.spin_P_inf.value())
+
+        rho = curve.get("rho", meta.get("rho", None))
+        if rho is None or not np.isfinite(float(rho)) or float(rho) <= 0.0:
+            rho = self.state.rho
+        if rho is None or not np.isfinite(float(rho)) or float(rho) <= 0.0:
+            rho = float(self.spin_rho.value())
+
+        uc = math.sqrt(float(p_inf) / float(rho)) if float(rho) > 0.0 else 1.0
+        tc = float(r_eq) / uc if uc > 0.0 else 1.0
+        return float(r_eq), uc, tc
+
+    def _display_tc_from_rmax(self, rmax: float, curve: dict | None = None) -> float:
+        rmax = float(rmax)
+        if not np.isfinite(rmax) or rmax <= 0.0:
+            return 1.0
+        _r_eq, uc, _tc_req = self._curve_normalization_context(curve)
+        return rmax / uc if uc > 0.0 else 1.0
+
+    def _selected_job_physics_for_plot(self) -> dict:
+        if self.state.mode != "jobs":
+            return {}
+        idx = self._selected_job_index() if hasattr(self, "tbl_jobs") else None
+        if idx is None or not (0 <= idx < len(self._jobs)):
+            return {}
+        return dict(self._jobs[idx].get("physics", {}) or {})
+
+    def _current_experiment_display_tc(self) -> tuple[float, float]:
+        if self.state.mode == "jobs":
+            idx = self._selected_job_index() if hasattr(self, "tbl_jobs") else None
+            if idx is not None and 0 <= idx < len(self._jobs):
+                exp = self._jobs[idx].get("experiment", {}) or {}
+                R = np.asarray(exp.get("R", []), dtype=float).reshape(-1)
+                R = R[np.isfinite(R)]
+                if R.size:
+                    rmax = float(np.nanmax(R))
+                    phys = self._selected_job_physics_for_plot()
+                    tc = self._display_tc_from_rmax(
+                        rmax,
+                        {
+                            "R_eq": exp.get("R_eq", None),
+                            "P_inf": phys.get("P_inf", exp.get("P_inf", None)),
+                            "rho": phys.get("rho", exp.get("rho", None)),
+                        },
+                    )
+                    return rmax, tc
+
+        if self.state.exp_R is not None:
+            R = np.asarray(self.state.exp_R, dtype=float).reshape(-1)
+            R = R[np.isfinite(R)]
+            if R.size:
+                rmax = float(np.nanmax(R))
+                tc = self._display_tc_from_rmax(
+                    rmax,
+                    {
+                        "R_eq": self.state.R_eq,
+                        "P_inf": self.state.P_inf,
+                        "rho": self.state.rho,
+                    },
+                )
+                return rmax, tc
+        return 1.0, 1.0
+
     def _seed_view_curves_from_current_canvas(self):
         if self._view_curves:
             return
@@ -1582,6 +1720,9 @@ class MainWindow(QMainWindow):
                 t=self.state.exp_t,
                 R=self.state.exp_R,
                 legend=name,
+                R_eq=self.state.R_eq,
+                P_inf=self.state.P_inf,
+                rho=self.state.rho,
                 redraw=False,
             )
         if self.state.sim_t is not None and self.state.sim_R is not None:
@@ -1591,6 +1732,9 @@ class MainWindow(QMainWindow):
                 R=self.state.sim_R,
                 legend=f"{self._get_active_model_key()} simulation",
                 meta=self.state.sim_meta,
+                R_eq=self._current_sim_R_eq_m(),
+                P_inf=self.state.P_inf,
+                rho=self.state.rho,
                 redraw=False,
             )
 
@@ -1602,6 +1746,9 @@ class MainWindow(QMainWindow):
         R: np.ndarray,
         legend: str,
         meta: dict | None = None,
+        R_eq: float | None = None,
+        P_inf: float | None = None,
+        rho: float | None = None,
         redraw: bool = True,
     ):
         t_arr = np.asarray(t, dtype=float).reshape(-1)
@@ -1611,15 +1758,45 @@ class MainWindow(QMainWindow):
             return
         if curve_type == "auto":
             curve_type = self._infer_curve_type(t_arr[:n], R_arr[:n])
+        curve_type = "experiment" if curve_type == "experiment" else "simulation"
+        if (
+            curve_type == "experiment"
+            and self._curve_view_active()
+            and not self._warned_curve_view_multi_exp_req
+            and any(str(c.get("type", "")).lower() == "experiment" for c in self._view_curves)
+        ):
+            QMessageBox.warning(
+                self,
+                "Multiple experimental curves",
+                "Curve View contains multiple experimental curves.\n\n"
+                "The current Req_exp field only corrects the editor preview, not each saved Curve View curve.\n"
+                "Please store Req in each MAT file before importing multiple experiments.\n\n"
+                "Recognized Req variable names include: Req, R_eq, R_equilibrium, R1_eq.",
+            )
+            self._warned_curve_view_multi_exp_req = True
+        r_eq_snapshot = R_eq
+        if r_eq_snapshot is None:
+            r_eq_snapshot = self.state.R_eq
+        if r_eq_snapshot is None or not np.isfinite(float(r_eq_snapshot)) or float(r_eq_snapshot) <= 0.0:
+            r_eq_snapshot = self._current_R_eq_m()
+        p_inf_snapshot = P_inf if P_inf is not None else self.state.P_inf
+        if p_inf_snapshot is None or not np.isfinite(float(p_inf_snapshot)) or float(p_inf_snapshot) <= 0.0:
+            p_inf_snapshot = float(self.spin_P_inf.value())
+        rho_snapshot = rho if rho is not None else self.state.rho
+        if rho_snapshot is None or not np.isfinite(float(rho_snapshot)) or float(rho_snapshot) <= 0.0:
+            rho_snapshot = float(self.spin_rho.value())
         curve = {
             "visible": True,
-            "type": "experiment" if curve_type == "experiment" else "simulation",
+            "type": curve_type,
             "legend": self._normalise_legend_text(legend),
             "color": self._next_view_curve_color(curve_type),
             "width": 1.5,
             "t": t_arr[:n].copy(),
             "R": R_arr[:n].copy(),
             "meta": dict(meta or {}),
+            "R_eq": float(r_eq_snapshot),
+            "P_inf": float(p_inf_snapshot),
+            "rho": float(rho_snapshot),
         }
         self._add_view_curve_row(curve)
         if redraw:
@@ -1902,6 +2079,11 @@ class MainWindow(QMainWindow):
             try:
                 mat = loadmat(path, squeeze_me=True, struct_as_record=False)
                 base_legend = self._curve_legend_from_mat(mat, Path(path).stem)
+                curve_R_eq = self._mat_to_float(mat, "R_eq", None)
+                if curve_R_eq is None:
+                    curve_R_eq = self._mat_to_float(mat, "Req", None)
+                curve_P_inf = self._mat_to_float(mat, "P_inf", None)
+                curve_rho = self._mat_to_float(mat, "rho", None)
                 t_sim = self._mat_array(mat, "t_sim")
                 R_sim = self._mat_array(mat, "R_sim")
                 t_exp = self._mat_array(mat, "t_exp")
@@ -1914,6 +2096,9 @@ class MainWindow(QMainWindow):
                         t=t_exp,
                         R=R_exp,
                         legend=f"{base_legend} exp" if has_sim_curve else base_legend,
+                        R_eq=curve_R_eq,
+                        P_inf=curve_P_inf,
+                        rho=curve_rho,
                         redraw=False,
                     )
                     added += 1
@@ -1929,6 +2114,9 @@ class MainWindow(QMainWindow):
                         R=R_sim,
                         legend=f"{base_legend} sim" if has_exp_curve else base_legend,
                         meta=meta,
+                        R_eq=curve_R_eq,
+                        P_inf=curve_P_inf,
+                        rho=curve_rho,
                         redraw=False,
                     )
                     added += 1
@@ -1940,6 +2128,9 @@ class MainWindow(QMainWindow):
                     t=exp.t,
                     R=exp.R,
                     legend=base_legend,
+                    R_eq=exp.R_eq,
+                    P_inf=exp.P_inf,
+                    rho=exp.rho,
                     redraw=False,
                 )
                 added += 1
@@ -1992,6 +2183,9 @@ class MainWindow(QMainWindow):
         colors = np.empty((1, n), dtype=object)
         widths = np.zeros((1, n), dtype=float)
         visible = np.zeros((1, n), dtype=bool)
+        r_eq_values = np.full((1, n), np.nan, dtype=float)
+        p_inf_values = np.full((1, n), np.nan, dtype=float)
+        rho_values = np.full((1, n), np.nan, dtype=float)
         for i, curve in enumerate(curves):
             t_cells[0, i] = np.asarray(curve.get("t", []), dtype=float).reshape(-1)
             r_cells[0, i] = np.asarray(curve.get("R", []), dtype=float).reshape(-1)
@@ -2000,11 +2194,14 @@ class MainWindow(QMainWindow):
             colors[0, i] = str(curve.get("color", "#1f77b4"))
             widths[0, i] = float(curve.get("width", 1.5))
             visible[0, i] = bool(curve.get("visible", True))
+            r_eq_values[0, i] = float(curve.get("R_eq", np.nan))
+            p_inf_values[0, i] = float(curve.get("P_inf", np.nan))
+            rho_values[0, i] = float(curve.get("rho", np.nan))
 
         savemat(
             path,
             {
-                "imr_view_format": "IMR fitting GUI curve view",
+                "imr_view_format": "IMRFit curve view",
                 "view_mode": self.state.view_mode,
                 "time_unit": "s",
                 "radius_unit": "m",
@@ -2015,6 +2212,9 @@ class MainWindow(QMainWindow):
                 "curve_color": colors,
                 "curve_width": widths,
                 "curve_visible": visible,
+                "curve_R_eq": r_eq_values,
+                "curve_P_inf": p_inf_values,
+                "curve_rho": rho_values,
                 "n_curves": n,
             },
             do_compression=False,
@@ -2958,6 +3158,7 @@ class MainWindow(QMainWindow):
             data["ui"] = {
                 "active_model": current_model,
                 "Req_um": float(self.spin_Req_um.value()),
+                "Req_exp_um": float(self.spin_Req_exp_um.value()),
                 "tspan_us": float(self.spin_tspan_us.value()),
                 "fit_window_auto": bool(self.chk_fit_window_cycles.isChecked()),
                 "fit_window_cycles": int(self.spin_fit_window_cycles.value()),
@@ -3077,6 +3278,10 @@ class MainWindow(QMainWindow):
 
         if ui.get("Req_um") is not None:
             self.spin_Req_um.setValue(float(ui["Req_um"]))
+        if ui.get("Req_exp_um") is not None and hasattr(self, "spin_Req_exp_um"):
+            self.spin_Req_exp_um.setValue(float(ui["Req_exp_um"]))
+        elif ui.get("Req_um") is not None and hasattr(self, "spin_Req_exp_um"):
+            self.spin_Req_exp_um.setValue(float(ui["Req_um"]))
         if ui.get("tspan_us") is not None:
             self.spin_tspan_us.setValue(float(ui["tspan_us"]))
         if ui.get("fit_window_cycles") is not None:
@@ -3639,27 +3844,49 @@ class MainWindow(QMainWindow):
     def _time_s_to_view(self, t_s: float) -> float:
         if self.state.view_mode == "dimensional":
             return t_s * 1e6
-        P_inf = float(self.spin_P_inf.value())
-        rho = float(self.spin_rho.value())
-        R_eq = float(self.spin_Req_um.value()) * 1e-6
-        Uc = np.sqrt(P_inf / rho) if rho > 0 else 1.0
-        tc = R_eq / Uc if Uc > 0 else 1.0
+        _rmax, tc = self._current_experiment_display_tc()
         t_rmax = 0.0
         if self.state.exp_t is not None and self.state.exp_R is not None:
             t_rmax = float(self.state.exp_t[int(np.argmax(self.state.exp_R))])
+        if self.state.mode == "jobs":
+            idx = self._selected_job_index() if hasattr(self, "tbl_jobs") else None
+            if idx is not None and 0 <= idx < len(self._jobs):
+                exp = self._jobs[idx].get("experiment", {}) or {}
+                t_arr = np.asarray(exp.get("t", []), dtype=float).reshape(-1)
+                r_arr = np.asarray(exp.get("R", []), dtype=float).reshape(-1)
+                n = min(t_arr.size, r_arr.size)
+                if n > 0:
+                    t_arr = t_arr[:n]
+                    r_arr = r_arr[:n]
+                    finite = np.isfinite(t_arr) & np.isfinite(r_arr)
+                    if np.any(finite):
+                        t_arr = t_arr[finite]
+                        r_arr = r_arr[finite]
+                        t_rmax = float(t_arr[int(np.argmax(r_arr))])
         return (t_s - t_rmax) / tc
 
     def _time_view_to_s(self, t_view: float) -> float:
         if self.state.view_mode == "dimensional":
             return t_view * 1e-6
-        P_inf = float(self.spin_P_inf.value())
-        rho = float(self.spin_rho.value())
-        R_eq = float(self.spin_Req_um.value()) * 1e-6
-        Uc = np.sqrt(P_inf / rho) if rho > 0 else 1.0
-        tc = R_eq / Uc if Uc > 0 else 1.0
+        _rmax, tc = self._current_experiment_display_tc()
         t_rmax = 0.0
         if self.state.exp_t is not None and self.state.exp_R is not None:
             t_rmax = float(self.state.exp_t[int(np.argmax(self.state.exp_R))])
+        if self.state.mode == "jobs":
+            idx = self._selected_job_index() if hasattr(self, "tbl_jobs") else None
+            if idx is not None and 0 <= idx < len(self._jobs):
+                exp = self._jobs[idx].get("experiment", {}) or {}
+                t_arr = np.asarray(exp.get("t", []), dtype=float).reshape(-1)
+                r_arr = np.asarray(exp.get("R", []), dtype=float).reshape(-1)
+                n = min(t_arr.size, r_arr.size)
+                if n > 0:
+                    t_arr = t_arr[:n]
+                    r_arr = r_arr[:n]
+                    finite = np.isfinite(t_arr) & np.isfinite(r_arr)
+                    if np.any(finite):
+                        t_arr = t_arr[finite]
+                        r_arr = r_arr[finite]
+                        t_rmax = float(t_arr[int(np.argmax(r_arr))])
         return t_view * tc + t_rmax
 
     # =====================================================================
@@ -3907,9 +4134,9 @@ class MainWindow(QMainWindow):
                     R_plot = R_curve * 1e6
                 else:
                     if curve.get("type") == "simulation" and meta:
-                        tc = float(meta.get("tc", 1.0)) or 1.0
                         rmax = float(meta.get("Rmax", 1.0)) or 1.0
                         t_rmax = float(meta.get("t_rmax", 0.0))
+                        tc = self._display_tc_from_rmax(rmax, curve)
                         t_plot = (t_curve - t_rmax) / tc
                         R_plot = R_curve / rmax
                     else:
@@ -3918,11 +4145,7 @@ class MainWindow(QMainWindow):
                             rmax = 1.0
                         idx_rmax = int(np.nanargmax(R_curve)) if R_curve.size else 0
                         t_rmax = float(t_curve[idx_rmax]) if t_curve.size else 0.0
-                        P_inf = float(self.spin_P_inf.value())
-                        rho = float(self.spin_rho.value())
-                        R_eq = float(self.spin_Req_um.value()) * 1e-6
-                        Uc = np.sqrt(P_inf / rho) if rho > 0 else 1.0
-                        tc = R_eq / Uc if Uc > 0 else 1.0
+                        tc = self._display_tc_from_rmax(rmax, curve)
                         t_plot = (t_curve - t_rmax) / tc
                         R_plot = R_curve / rmax
                 label = str(curve.get("legend", "curve"))
@@ -3955,14 +4178,17 @@ class MainWindow(QMainWindow):
                 t_plot = t_exp * 1e6
                 R_plot = R_exp * 1e6
             else:
-                P_inf = float(self.spin_P_inf.value())
-                rho = float(self.spin_rho.value())
-                R_eq = float(self.spin_Req_um.value()) * 1e-6
-                Uc = np.sqrt(P_inf / rho) if rho > 0 else 1.0
-                tc = R_eq / Uc if Uc > 0 else 1.0
                 Rmax = float(np.max(R_exp))
                 idx = int(np.argmax(R_exp))
                 t_rmax = float(t_exp[idx])
+                tc = self._display_tc_from_rmax(
+                    Rmax,
+                    {
+                        "R_eq": self.state.R_eq,
+                        "P_inf": self.state.P_inf,
+                        "rho": self.state.rho,
+                    },
+                )
                 t_plot = (t_exp - t_rmax) / tc
                 R_plot = R_exp / Rmax
             self.canvas.plot_experiment(t_plot, R_plot)
@@ -3983,8 +4209,17 @@ class MainWindow(QMainWindow):
                 t_plot = t_sim * 1e6
                 R_plot = R_sim * 1e6
             else:
-                t_plot = (t_sim - meta["t_rmax"]) / meta["tc"]
-                R_plot = R_sim / meta["Rmax"]
+                rmax = float(meta["Rmax"])
+                tc = self._display_tc_from_rmax(
+                    rmax,
+                    {
+                        "R_eq": self._current_sim_R_eq_m(),
+                        "P_inf": float(self.spin_P_inf.value()),
+                        "rho": float(self.spin_rho.value()),
+                    },
+                )
+                t_plot = (t_sim - meta["t_rmax"]) / tc
+                R_plot = R_sim / rmax
             self.canvas.plot_simulation(t_plot, R_plot)
 
         best_fit_t = self.state.best_fit_t
@@ -4002,11 +4237,20 @@ class MainWindow(QMainWindow):
                 R_plot = best_fit_R * 1e6
             else:
                 if bf_meta:
+                    rmax = float(bf_meta.get("Rmax", 1))
+                    plot_phys = self._selected_job_physics_for_plot()
                     t_plot = (
                         (best_fit_t - bf_meta.get("t_rmax", 0))
-                        / bf_meta.get("tc", 1)
+                        / self._display_tc_from_rmax(
+                            rmax,
+                            {
+                                "R_eq": self._current_sim_R_eq_m(),
+                                "P_inf": plot_phys.get("P_inf", float(self.spin_P_inf.value())),
+                                "rho": plot_phys.get("rho", float(self.spin_rho.value())),
+                            },
+                        )
                     )
-                    R_plot = best_fit_R / bf_meta.get("Rmax", 1)
+                    R_plot = best_fit_R / rmax
                 else:
                     t_plot = best_fit_t
                     R_plot = best_fit_R
@@ -4438,6 +4682,9 @@ class MainWindow(QMainWindow):
                 t=t,
                 R=R,
                 legend=legend or Path(path).stem,
+                R_eq=Req,
+                P_inf=P_inf,
+                rho=rho,
             )
             if sim_t_clean is not None and sim_R_clean is not None:
                 self._add_curve_to_view(
@@ -4446,6 +4693,9 @@ class MainWindow(QMainWindow):
                     R=sim_R_clean,
                     legend=f"{legend or Path(path).stem} simulation",
                     meta=sim_meta,
+                    R_eq=Req,
+                    P_inf=P_inf,
+                    rho=rho,
                 )
             self.statusBar().showMessage(f"Imported curve(s) into Curve View: {Path(path).name}")
             self._redraw_all()
@@ -4476,7 +4726,7 @@ class MainWindow(QMainWindow):
         if Req is None and R.size > 0:
             self.state.R_eq = float(np.mean(R[-min(20, R.size):]))
         if self.state.R_eq is not None:
-            self.spin_Req_um.setValue(float(self.state.R_eq) * 1e6)
+            self._set_req_controls_from_exp(float(self.state.R_eq), update_sim=True)
         if P_inf is not None:
             self.spin_P_inf.setValue(float(P_inf))
         if rho is not None:
@@ -4529,7 +4779,8 @@ class MainWindow(QMainWindow):
             "- t_sim / R_sim: simulation curve, if present\n"
             "- Req, R_eq, or R_equilibrium: equilibrium radius in meters\n"
             "- legend: curve label string\n"
-            "- P_inf, rho, c_long, gamma: physical constants in SI units"
+            "- P_inf, rho, c_long, gamma: physical constants in SI units\n"
+            "- struct_best_fit: saved fitting parameters and bounds"
         )
         btn_units = QPushButton("Use um/us")
         left_buttons.addWidget(btn_import)
@@ -4626,10 +4877,11 @@ class MainWindow(QMainWindow):
         buttons.addWidget(btn_close)
         root.addLayout(buttons)
 
-        ctx = {"path": "", "flat": {}, "pixel_time_warning_accepted": False}
+        ctx = {"path": "", "flat": {}, "mat": {}, "pixel_time_warning_accepted": False}
         array_rows: dict[str, QComboBox] = {}
         scalar_rows: dict[str, tuple[QComboBox, QLineEdit]] = {}
         unit_rows: dict[str, QComboBox] = {}
+        parameter_combo: dict[str, QComboBox | QLineEdit] = {}
         using_micro_units = {"value": False}
 
         def clear_layout(layout: QFormLayout):
@@ -4831,12 +5083,14 @@ class MainWindow(QMainWindow):
             keys = sorted(flat.keys(), key=str.lower)
             ctx["path"] = path
             ctx["flat"] = flat
+            ctx["mat"] = mat
             lbl_path.setText(path)
             clear_layout(arr_form)
             clear_layout(scalar_form)
             array_rows.clear()
             scalar_rows.clear()
             unit_rows.clear()
+            parameter_combo.clear()
 
             array_specs = [
                 ("t_exp", self._import_wizard_keywords["t_exp"]),
@@ -4927,6 +5181,36 @@ class MainWindow(QMainWindow):
                 ("t_end", self._import_wizard_keywords["t_end"]),
                 ("LSQErr", self._import_wizard_keywords["LSQErr"]),
             ]
+            param_row = QHBoxLayout()
+            param_cb = self._wizard_combo(keys, self._import_wizard_keywords["parameters"], scalar_only=False, flat=flat)
+            param_preview = QLineEdit()
+            param_preview.setReadOnly(True)
+            param_preview.setToolTip("Preview of struct_best_fit parameters mapped to the current model.")
+
+            def update_param_preview():
+                key = param_cb.currentData()
+                if not key:
+                    param_preview.setText("")
+                    return
+                try:
+                    parsed = self._parse_struct_best_fit_value(flat[key])
+                    known = set(self._param_rows.keys())
+                    matched = sorted(name for name in parsed if name in known)
+                    if matched:
+                        param_preview.setText(f"{len(matched)} matched: {', '.join(matched[:4])}{'...' if len(matched) > 4 else ''}")
+                    else:
+                        param_preview.setText(f"{len(parsed)} parameter(s); mapped on import")
+                except Exception as exc:
+                    param_preview.setText(f"Cannot parse: {exc}")
+
+            param_cb.currentIndexChanged.connect(lambda _idx: update_param_preview())
+            parameter_combo["combo"] = param_cb
+            parameter_combo["preview"] = param_preview
+            param_row.addWidget(param_cb, stretch=2)
+            param_row.addWidget(param_preview, stretch=1)
+            scalar_form.addRow("parameters:", param_row)
+            update_param_preview()
+
             for label, candidates in scalar_specs:
                 combo = self._wizard_combo(keys, candidates, scalar_only=(label != "legend"), flat=flat)
                 preview = make_scalar_preview_edit()
@@ -5014,9 +5298,24 @@ class MainWindow(QMainWindow):
             except Exception:
                 return converted
 
+        def apply_selected_parameters() -> int:
+            combo = parameter_combo.get("combo")
+            if combo is None:
+                return 0
+            key = combo.currentData()
+            if not key:
+                return 0
+            src = self._parse_struct_best_fit_value(ctx["flat"][key])
+            if not src and isinstance(ctx.get("mat"), dict) and key in ctx["mat"]:
+                src = self._parse_struct_best_fit_value(ctx["mat"][key])
+            if not src:
+                raise ValueError(f"Could not parse parameters from '{key}'.")
+            return self._apply_struct_best_fit_params(src, str(ctx["path"]) or str(key))
+
         def apply_import():
             try:
                 path = str(ctx["path"])
+                param_count = 0
                 has_time_mapping = bool(array_rows.get("t_exp") and array_rows["t_exp"].currentData())
                 if (
                     has_time_mapping
@@ -5039,7 +5338,14 @@ class MainWindow(QMainWindow):
                 R = selected_array("R_exp")
                 if t is None or R is None:
                     if R is None:
-                        raise ValueError("Please map R_exp before importing.")
+                        param_count = apply_selected_parameters()
+                        if param_count:
+                            self.lbl_output.appendPlainText(
+                                f"Imported {param_count} parameter(s) from {Path(path).name}."
+                            )
+                            dlg.close()
+                            return
+                        raise ValueError("Please map R_exp before importing, or select struct_best_fit to import parameters only.")
                     fps = float(spin_fps.value())
                     if not np.isfinite(fps) or fps <= 0:
                         raise ValueError("fps must be positive to reconstruct t_exp.")
@@ -5080,6 +5386,11 @@ class MainWindow(QMainWindow):
                     R_sim=R_sim,
                     import_metadata=import_meta,
                 )
+                param_count = apply_selected_parameters()
+                if param_count:
+                    self.lbl_output.appendPlainText(
+                        f"Imported experiment and {param_count} parameter(s) from {Path(path).name}."
+                    )
                 dlg.close()
             except Exception as exc:
                 QMessageBox.critical(dlg, "Import failed", f"{exc}\n\n{traceback.format_exc()}")
@@ -5098,6 +5409,12 @@ class MainWindow(QMainWindow):
                     continue
                 current = updated.get(name, [])
                 updated[name] = [str(selected)] + [v for v in current if v != str(selected)]
+            combo = parameter_combo.get("combo")
+            if combo is not None:
+                selected = combo.currentData()
+                if selected:
+                    current = updated.get("parameters", [])
+                    updated["parameters"] = [str(selected)] + [v for v in current if v != str(selected)]
             return updated
 
         def set_wizard_defaults():
@@ -5230,7 +5547,7 @@ class MainWindow(QMainWindow):
                 self.state.R_eq = float(np.mean(exp.R[-min(20, exp.R.size):]))
 
             if self.state.R_eq is not None:
-                self.spin_Req_um.setValue(self.state.R_eq * 1e6)
+                self._set_req_controls_from_exp(float(self.state.R_eq), update_sim=True)
 
             file_info = []
             if exp.P_inf is not None:
@@ -5277,6 +5594,9 @@ class MainWindow(QMainWindow):
                     t=exp.t,
                     R=exp.R,
                     legend=curve_legend,
+                    R_eq=self.state.R_eq,
+                    P_inf=self.state.P_inf,
+                    rho=self.state.rho,
                 )
 
             extra = ""
@@ -5396,7 +5716,7 @@ class MainWindow(QMainWindow):
             f"Points: {fit_window.get('n_points', 0)}",
         ]
         if job.get("lsq_err") is not None:
-            lines.append(f"LSQErr: {job['lsq_err']:.6g}")
+            lines.append(self._format_lsqerr_display(job["lsq_err"], self._lsqerr_ref_radius_m(job), ".6g"))
         best_params = job.get("best_params")
         if isinstance(best_params, dict) and best_params:
             lines.append("Best-fit parameters:")
@@ -5523,11 +5843,7 @@ class MainWindow(QMainWindow):
         if n_points < 3:
             return None, f"Fit window contains fewer than 3 points ({n_points})."
 
-        req_m = (
-            float(exp_R_eq)
-            if exp_R_eq is not None and np.isfinite(float(exp_R_eq)) and float(exp_R_eq) > 0.0
-            else float(self.spin_Req_um.value()) * 1e-6
-        )
+        req_m = float(self.spin_Req_um.value()) * 1e-6
 
         return {
             "version": 1,
@@ -5685,11 +6001,7 @@ class MainWindow(QMainWindow):
             return None, "Experiment data is empty or invalid."
 
         fit_flags, scales, bounds_si = self._collect_fit_setup()
-        req_m = (
-            float(exp_R_eq)
-            if exp_R_eq is not None and np.isfinite(float(exp_R_eq)) and float(exp_R_eq) > 0.0
-            else float(self.spin_Req_um.value()) * 1e-6
-        )
+        req_m = float(self.spin_Req_um.value()) * 1e-6
         return {
             "version": 1,
             "type": "simulation",
@@ -6269,6 +6581,8 @@ class MainWindow(QMainWindow):
         settings = job.get("experiment_settings", {})
         if settings.get("Req_um") is not None:
             self.spin_Req_um.setValue(float(settings["Req_um"]))
+        if self.state.R_eq is not None and hasattr(self, "spin_Req_exp_um"):
+            self.spin_Req_exp_um.setValue(float(self.state.R_eq) * 1e6)
         if settings.get("tspan_us") is not None:
             self.spin_tspan_us.setValue(float(settings["tspan_us"]))
 
@@ -6535,7 +6849,100 @@ class MainWindow(QMainWindow):
     def _parse_struct_best_fit_from_mat(mat: dict) -> dict[str, dict]:
         if "struct_best_fit" not in mat:
             return {}
-        flat = np.ravel(mat["struct_best_fit"])
+        return MainWindow._parse_struct_best_fit_value(mat["struct_best_fit"])
+
+    @staticmethod
+    def _parse_struct_best_fit_value(value) -> dict[str, dict]:
+        legacy_layouts: dict[int, list[str]] = {
+            2: ["G", "mu"],
+            3: ["U0", "G", "mu"],
+            7: ["U0", "GA", "alpha", "GB", "beta", "mu", "lambda_Y"],
+            11: [
+                "U0", "GA1", "GA2", "alpha1", "alpha2",
+                "GB1", "GB2", "beta1", "beta2", "mu", "lambda_Y",
+            ],
+        }
+
+        def _looks_like_mcos_string(text: str) -> bool:
+            return "MCOS" in text or "MatlabOpaque" in text or text.startswith("(b'")
+
+        def _string_array(raw) -> list[str]:
+            arr0 = np.asarray(raw)
+            if arr0.dtype.kind in ("U", "S") and arr0.ndim == 2:
+                return [
+                    "".join(str(part.decode(errors="replace") if isinstance(part, bytes) else part) for part in row).strip()
+                    for row in arr0
+                ]
+            arr = arr0.reshape(-1)
+            out: list[str] = []
+            for item in arr:
+                if isinstance(item, bytes):
+                    out.append(item.decode(errors="replace").strip())
+                else:
+                    text = str(item).strip()
+                    out.append(text)
+            return out
+
+        def _float_array(raw) -> np.ndarray:
+            try:
+                return np.asarray(raw, dtype=float).reshape(-1)
+            except Exception:
+                return np.array([], dtype=float)
+
+        def _parse_columns(names_raw, vals_raw, lbs_raw=None, ubs_raw=None, scales_raw=None) -> dict[str, dict]:
+            names = _string_array(names_raw)
+            vals = _float_array(vals_raw)
+            lbs = _float_array(lbs_raw) if lbs_raw is not None else np.array([], dtype=float)
+            ubs = _float_array(ubs_raw) if ubs_raw is not None else np.array([], dtype=float)
+            scales = _string_array(scales_raw) if scales_raw is not None else []
+            out: dict[str, dict] = {}
+            for i, name in enumerate(names):
+                try:
+                    if not name or _looks_like_mcos_string(name) or i >= vals.size:
+                        continue
+                    out[name] = {
+                        "value": float(vals[i]),
+                        "lb": float(lbs[i]) if i < lbs.size else np.nan,
+                        "ub": float(ubs[i]) if i < ubs.size else np.nan,
+                        "scale": scales[i] if i < len(scales) and scales[i] else "lin",
+                    }
+                except Exception:
+                    continue
+            return out
+
+        if isinstance(value, dict) and {"name", "value"}.issubset(value.keys()):
+            return _parse_columns(
+                value.get("name", []),
+                value.get("value", []),
+                value.get("lb", []),
+                value.get("ub", []),
+                value.get("scale", []),
+            )
+
+        if hasattr(value, "_fieldnames") and {"name", "value"}.issubset(set(value._fieldnames)):
+            parsed = _parse_columns(
+                getattr(value, "name"),
+                getattr(value, "value"),
+                getattr(value, "lb", []),
+                getattr(value, "ub", []),
+                getattr(value, "scale", []),
+            )
+            if parsed:
+                return parsed
+
+        arr_value = np.asarray(value)
+        if arr_value.dtype.names and {"name", "value"}.issubset(set(arr_value.dtype.names)):
+            parsed = _parse_columns(
+                arr_value["name"],
+                arr_value["value"],
+                arr_value["lb"] if "lb" in arr_value.dtype.names else [],
+                arr_value["ub"] if "ub" in arr_value.dtype.names else [],
+                arr_value["scale"] if "scale" in arr_value.dtype.names else [],
+            )
+            if parsed:
+                return parsed
+
+        flat = np.ravel(value)
 
         def _to_str(rec, field: str) -> str:
             val = getattr(rec, field)
@@ -6558,17 +6965,125 @@ class MainWindow(QMainWindow):
         for rec in flat:
             try:
                 name = _to_str(rec, "name")
-                if not name or "MCOS" in name:
+                if not name or _looks_like_mcos_string(name):
                     continue
+                scale = _to_str(rec, "scale")
                 out[name] = {
                     "value": _to_float(rec, "value"),
                     "lb": _to_float(rec, "lb"),
                     "ub": _to_float(rec, "ub"),
-                    "scale": _to_str(rec, "scale") or "lin",
+                    "scale": "" if _looks_like_mcos_string(scale) else (scale or "lin"),
                 }
             except Exception:
                 continue
+        if out:
+            return out
+
+        layout = legacy_layouts.get(len(flat))
+        if layout:
+            for i, rec in enumerate(flat):
+                try:
+                    out[layout[i]] = {
+                        "value": _to_float(rec, "value"),
+                        "lb": _to_float(rec, "lb"),
+                        "ub": _to_float(rec, "ub"),
+                        "scale": "",
+                    }
+                except Exception:
+                    continue
         return out
+
+    def _apply_struct_best_fit_params(self, src: dict[str, dict], source_label: str = "") -> int:
+        known_names = set(self._param_rows.keys())
+
+        def _stem(name: str) -> str:
+            return name[:-1] if name and name[-1] in "12" else name
+
+        def _best_match(target: str) -> dict | None:
+            if target in src:
+                return src[target]
+
+            tgt_stem = _stem(target)
+            tgt_sfx = target[len(tgt_stem):]
+            if tgt_sfx == "2":
+                return src.get(tgt_stem + "2")
+
+            priority = {"1": 0, "": 1, "2": 2}
+            candidates: list[tuple[int, dict]] = []
+            for sname, data in src.items():
+                s_stem = _stem(sname)
+                s_sfx = sname[len(s_stem):]
+                if s_stem == tgt_stem:
+                    candidates.append((priority.get(s_sfx, 9), data))
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda item: item[0])
+            current_prio = None
+            same_level: list[dict] = []
+            for prio, data in candidates:
+                if prio != current_prio:
+                    non_zero = [item for item in same_level if float(item.get("value", 0.0)) != 0.0]
+                    if non_zero:
+                        return non_zero[0]
+                    current_prio = prio
+                    same_level = []
+                same_level.append(data)
+            non_zero = [item for item in same_level if float(item.get("value", 0.0)) != 0.0]
+            if non_zero:
+                return non_zero[0]
+            return candidates[0][1]
+
+        values: dict[str, float] = {}
+        param_bounds: dict[str, dict] = {}
+        for target in known_names:
+            data = _best_match(target)
+            if data is None:
+                continue
+            try:
+                value = float(data.get("value", np.nan))
+            except Exception:
+                continue
+            values[target] = value
+            raw_scale = str(data.get("scale", "") or "").strip()
+            if not raw_scale:
+                fw = self._fit_widgets.get(target)
+                raw_scale = fw["cmb_scale"].currentText() if fw else "lin"
+            param_bounds[target] = {
+                "lb": float(data.get("lb", np.nan)),
+                "ub": float(data.get("ub", np.nan)),
+                "scale": raw_scale,
+            }
+
+        for name, val in values.items():
+            row = self._param_rows.get(name)
+            if row:
+                factor = self._get_unit_factor(name)
+                row["spin"].setValue(val / factor)
+
+        for name, meta in param_bounds.items():
+            fw = self._fit_widgets.get(name)
+            if fw:
+                factor = self._get_unit_factor(name)
+                if np.isfinite(float(meta["lb"])):
+                    fw["spin_lb"].setValue(float(meta["lb"]) / factor)
+                if np.isfinite(float(meta["ub"])):
+                    fw["spin_ub"].setValue(float(meta["ub"]) / factor)
+                fw["cmb_scale"].setCurrentText(meta.get("scale", "lin"))
+
+        if values:
+            self.state.param_bounds = param_bounds
+            if source_label:
+                self.statusBar().showMessage(f"Parameters loaded from {source_label}")
+            return len(values)
+
+        src_names = sorted(src.keys())
+        tgt_names = sorted(known_names)
+        raise ValueError(
+            "Could not map struct_best_fit to current model parameters.\n\n"
+            f"MAT file names:      {src_names}\n\n"
+            f"Current model needs: {tgt_names}"
+        )
 
     def _job_from_result_mat(self, path: str, mat: dict) -> dict | None:
         t_sim = self._mat_array(mat, "t_sim")
@@ -7589,7 +8104,8 @@ class MainWindow(QMainWindow):
             self.state.best_fit_meta = job.get("best_fit_meta")
         status_info = f"  [{prog.status}]" if prog.status else ""
         self.lbl_output.appendPlainText(
-            f"job={idx + 1}\t|\tnfev={prog.nfev}\t|\tLSQErr={prog.best_err:.4e}"
+            f"job={idx + 1}\t|\tnfev={prog.nfev}\t|\t"
+            f"{self._format_lsqerr_display(prog.best_err, self._lsqerr_ref_radius_m(job))}"
             f"{status_info}"
         )
         target = float(job.get("optimizer", {}).get("f_tol", 0.0))
@@ -7754,7 +8270,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self.lbl_output.appendPlainText(
-                f"job={idx + 1}\t|\tsimulation completed\t|\tLSQErr={lsq_err:.4e} over {n_lsq} point(s)"
+                f"job={idx + 1}\t|\tsimulation completed\t|\t"
+                f"{self._format_lsqerr_display(lsq_err, self._lsqerr_ref_radius_m(job))} over {n_lsq} point(s)"
             )
 
         done_worker = worker or self._queue_sim_workers.get(idx)
@@ -7866,6 +8383,9 @@ class MainWindow(QMainWindow):
                     R=out.R_sim,
                     legend=f"{model_key} simulation {len(self._view_curves) + 1}",
                     meta=self.state.sim_meta,
+                    R_eq=float(self.spin_Req_um.value()) * 1e-6,
+                    P_inf=float(self.spin_P_inf.value()),
+                    rho=float(self.spin_rho.value()),
                 )
 
             self._redraw_all()
@@ -7892,7 +8412,7 @@ class MainWindow(QMainWindow):
                 if t0_us > t1_us:
                     t0_us, t1_us = t1_us, t0_us
                 lines.append(
-                    f"{_ind}  LSQErr={lsq_err:.4e} over {n_lsq} point(s) "
+                    f"{_ind}  {self._format_lsqerr_display(lsq_err)} over {n_lsq} point(s) "
                     f"[{t0_us:.3f}, {t1_us:.3f}] us"
                 )
             elif lsq_msg:
@@ -8153,7 +8673,7 @@ class MainWindow(QMainWindow):
         if prog.status:
             status_info = f"  [{prog.status}]"
         self.lbl_output.appendPlainText(
-            f"nfev={prog.nfev}\t|\tLSQErr={prog.best_err:.4e}"
+            f"nfev={prog.nfev}\t|\t{self._format_lsqerr_display(prog.best_err)}"
             f"{step_info}{status_info}{elapsed}"
         )
 
@@ -8165,7 +8685,7 @@ class MainWindow(QMainWindow):
             self._fit_dialog.setLabelText(
                 f"Fitting {model_key}...\n"
                 f"Elapsed {self._sec_to_hms(el)}\n"
-                f"Best LSQErr: {prog.best_err:.4e}  |  nfev: {prog.nfev}"
+                f"Best {self._format_lsqerr_display(prog.best_err)}  |  nfev: {prog.nfev}"
             )
 
     def _on_fit_ok(self, res: FitResult):
@@ -8211,7 +8731,7 @@ class MainWindow(QMainWindow):
         label = "Fit stopped" if was_stopped else "Fit completed"
         extra = f", elapsed {self._sec_to_hms(elapsed)}" if elapsed else ""
         self.lbl_output.appendPlainText(
-            f"--- {label}{extra}\t|\tnfev={res.nfev}\t|\tLSQErr={res.lsq_err:.4e}"
+            f"--- {label}{extra}\t|\tnfev={res.nfev}\t|\t{self._format_lsqerr_display(res.lsq_err)}"
         )
         self.statusBar().showMessage(label)
 

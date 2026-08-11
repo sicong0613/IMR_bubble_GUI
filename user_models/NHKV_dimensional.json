@@ -1,0 +1,62 @@
+{
+  "id": "NHKV_DIM",
+  "display_name": "NHKV dimensional reference",
+  "description": "Diagnostic NHKV solver that integrates R, U, P, and elastic stress in SI units instead of using nondimensional radius and time as ODE state variables.",
+  "solver_entrypoint": "nhkv_dimensional_solver:simulate",
+  "parameters": [
+    {
+      "name": "U0",
+      "label": "U0",
+      "units": [
+        { "label": "m/s", "factor": 1.0 }
+      ],
+      "default": 100.0,
+      "lb": 80.0,
+      "ub": 120.0,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "G",
+      "label": "G",
+      "units": [
+        { "label": "Pa",  "factor": 1.0 },
+        { "label": "kPa", "factor": 1e3 },
+        { "label": "MPa", "factor": 1e6 }
+      ],
+      "default": 8.0e6,
+      "lb": 1.0e6,
+      "ub": 2.0e7,
+      "scale": "log",
+      "fit_default": true
+    },
+    {
+      "name": "mu",
+      "label": "mu",
+      "units": [
+        { "label": "Pa*s", "factor": 1.0 }
+      ],
+      "default": 0.226,
+      "lb": 0.01,
+      "ub": 1.0,
+      "scale": "log",
+      "fit_default": true
+    }
+  ],
+  "constants": {
+    "_comment": "Same constants as built-in NHKV. This model is intended for diagnostic comparison.",
+    "T_inf":  298.15,
+    "c_long": 1485.0,
+    "gamma":  0.056,
+    "alpha":  0.0,
+    "D0":     24.2e-6,
+    "kappa":  1.4,
+    "Ru":     8.3144598,
+    "A_therm": 5.28e-5,
+    "B_therm": 0.0117,
+    "P_ref":  1.17e11,
+    "T_ref":  5200.0,
+    "M_vapor": 18.01528e-3,
+    "M_air":  28.966e-3
+  }
+}

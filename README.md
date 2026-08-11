@@ -1,6 +1,6 @@
-# IMR Fitting GUI
+# IMRFit
 
-**Beta 1.2**
+**Beta 1.3**
 
 A Python desktop application for inertial microrheology (IMR) bubble simulation and parameter fitting, replacing the original MATLAB `patternsearch + IMR` workflow.
 
@@ -177,7 +177,7 @@ or:
 python -m imr_gui
 ```
 
-The main window title should read `IMR Fitting GUI (beta 1.2)`.
+The main window title should read `IMRFit (beta 1.3)`.
 
 ---
 

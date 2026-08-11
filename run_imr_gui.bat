@@ -5,7 +5,7 @@ set "VENV_DIR=C:\venvs\imr-gui"
 set "PROJECT_DIR=%~dp0"
 
 if not exist "%VENV_DIR%\Scripts\python.exe" (
-    echo IMR Fitting GUI virtual environment was not found:
+    echo IMRFit virtual environment was not found:
     echo   %VENV_DIR%
     echo.
     echo Create it with:
@@ -24,6 +24,6 @@ cd /d "%PROJECT_DIR%"
 
 if errorlevel 1 (
     echo.
-    echo IMR Fitting GUI exited with an error.
+    echo IMRFit exited with an error.
     pause
 )
